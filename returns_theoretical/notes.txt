@@ -1,0 +1,122 @@
+## For 1 million tests with randomized instances:
+
+Largest Optimality Gap: 13.17613259408688
+f: 0.5092543011261306
+Utilities: [0.57526789 0.23206349 0.11059733 1.24988881 1.38028737]
+Prices: [91.19355189 97.4371523  94.86760598 45.89314025 61.25704392]
+Bulk Optimal Set: (0,)
+Sequential Optimal Set: (0, 1, 2)
+
+## Results from arbitrarily scaling last two prices.
+P       Bulk Profit     Seq Profit      Gap
+100     89.93           93.72           3.79
+200     179.95          187.98          8.03
+300     269.98          282.23          12.26
+400     360.00          376.49          16.49
+500     450.03          470.75          20.72
+600     540.05          565.01          24.96
+700     630.07          659.26          29.19
+800     720.10          753.52          33.42
+900     810.12          847.78          37.65
+1000    900.15          942.04          41.89
+
+Worst Instance Found
+-----------------------
+f: 0.4891578876064888
+prices: [94.83358176 94.25301307 93.95723924]
+utilities: [0.00144167 0.00479687 0.00083068]
+
+Bulk best assortment: (0,)
+Sequential best assortment: (0, 1, 2)
+
+Bulk profit: 58.440555187208304
+Sequential profit: 77.03003751069012
+
+Worst-case ratio: 1.318092158158531
+----
+Worst Instance Found
+
+-----------------------
+
+f: 0.4941142274957231
+prices: [70.92278107 71.26393221 70.49087214 68.97521228]
+utilities: [0.00323878 0.00163872 0.00290165 0.07647515]
+
+Bulk best assortment: (1, 3)
+Sequential best assortment: (0, 1, 2, 3)
+
+Bulk profit: 52.963402939266885
+Sequential profit: 59.39487729504845
+
+Worst-case ratio: 1.1214324231235016
+
+------
+f: 0.506998052786148
+prices: [94.58294187 96.89472015 99.47255327 98.44542917 95.40465988]
+utilities: [0.05152955 0.05605078 0.0068055  0.03439567 0.01303856]
+
+Bulk best assortment: (2,)
+Sequential best assortment: (0, 1, 2, 3, 4)
+
+Bulk profit: 61.865444727976886
+Sequential profit: 84.52543565131444
+
+Worst-case ratio: 1.3662786394403823
+
+-------
+Worst Instance Found
+-----------------------
+f: 0.486645117441703
+prices: [93.50236681 96.1352285  95.01214777 91.08693331 79.26172587 95.0298643 ]
+utilities: [0.0327238  0.02705993 0.05247124 0.08137751 0.27928679 0.01811749]
+
+Bulk best assortment: (1, 2)
+Sequential best assortment: (0, 1, 2, 3, 5)
+
+Bulk profit: 72.54937403226067
+Sequential profit: 81.88104954152875
+
+Worst-case ratio: 1.1286251691864158
+
+========{N > 2 RUNS}=========
+Worst Instance Found (N = 3)
+-----------------------
+f: 0.5013704055554266
+prices: [7474.15257572 7499.49434477 7522.62837782]
+utilities: [0.03165528 0.01552714 0.01567784]
+
+Bulk best assortment: (2,)
+Sequential best assortment: (0, 1, 2)
+
+Bulk profit: 4712.231840878682
+Sequential profit: 6259.489041507699
+
+Worst-case ratio: 1.3283491247621853
+
+Worst Instance Found (N = 4)
+-----------------------
+f: 0.49100633084309003
+prices: [8572.49796403 8518.06094004 8612.52219152 8443.10907904]
+utilities: [0.0353496  0.04278016 0.0189494  0.01117689]
+
+Bulk best assortment: (0,)
+Sequential best assortment: (0, 1, 2, 3)
+
+Bulk profit: 5388.581949654508
+Sequential profit: 7428.531559091461
+
+Worst-case ratio: 1.378568912655721
+
+Worst Instance Found (N = 5)
+-----------------------
+f: 0.49841146961904653
+prices: [9684.75016051 9687.04724703 9799.95535588 9712.88006621 9827.65113295]
+utilities: [0.04902546 0.03895672 0.01213375 0.04395261 0.01248514]
+
+Bulk best assortment: (4,)
+Sequential best assortment: (0, 1, 2, 3, 4)
+
+Bulk profit: 6142.070470672062
+Sequential profit: 8713.106920141574
+
+Worst-case ratio: 1.4185944237771324
