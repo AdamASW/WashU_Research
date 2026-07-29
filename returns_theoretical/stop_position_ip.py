@@ -6,6 +6,15 @@ import numpy as np
 import pandas as pd
 
 try:
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    from scipy.sparse import coo_matrix
+except Exception:  # pragma: no cover
+    Bounds = None
+    LinearConstraint = None
+    milp = None
+    coo_matrix = None
+
+try:
     import gurobipy as gp
     from gurobipy import GRB
 except Exception:  # pragma: no cover
@@ -26,6 +35,156 @@ class StopIPResult:
     objective_hits: float
     hit_rate: float
     predicted_stop_idx: Dict[str, int]
+
+
+def _solve_first_trigger_stop_ip_scipy(
+    examples: List[SessionExample],
+    epsilon: float,
+    big_m: float,
+    w_min: float,
+    w_max: float,
+) -> Tuple[np.ndarray, float, Dict[str, int]]:
+    """SciPy MILP fallback for environments without Gurobi.
+
+    Uses an equivalent first-trigger encoding with cumulative trigger variables.
+    This reduces constraint growth from quadratic-in-session-length to linear,
+    which is much more memory efficient on large datasets.
+    """
+    if milp is None or Bounds is None or LinearConstraint is None or coo_matrix is None:
+        raise ImportError(
+            "No MILP backend available. Install gurobipy or scipy with optimize.milp support."
+        )
+
+    p_max = max(len(ex.weights) for ex in examples)
+
+    # Flat variable layout:
+    # [r_0..r_{p_max-1}, t_(q,p) for all valid pairs, y_(q,p) for all valid pairs]
+    # where y_(q,p) = OR_{k<=p} t_(q,k) (cumulative trigger state).
+    t_index: Dict[Tuple[int, int], int] = {}
+    y_index: Dict[Tuple[int, int], int] = {}
+
+    next_idx = p_max
+    for q, ex in enumerate(examples):
+        for p in range(len(ex.weights)):
+            t_index[q, p] = next_idx
+            next_idx += 1
+
+    for q, ex in enumerate(examples):
+        for p in range(len(ex.weights)):
+            y_index[q, p] = next_idx
+            next_idx += 1
+
+    n_vars = next_idx
+
+    # Objective: maximize hits at true first-trigger stop.
+    # If s_q is true stop: hit_q = y[q,s_q] - y[q,s_q-1] (with y[q,-1] := 0).
+    # milp minimizes, so minimize -sum_q hit_q.
+    c = np.zeros(n_vars, dtype=np.float64)
+    for q, ex in enumerate(examples):
+        s_q = ex.true_stop_idx
+        c[y_index[q, s_q]] -= 1.0
+        if s_q > 0:
+            c[y_index[q, s_q - 1]] += 1.0
+
+    lb = np.full(n_vars, -np.inf, dtype=np.float64)
+    ub = np.full(n_vars, np.inf, dtype=np.float64)
+    integrality = np.zeros(n_vars, dtype=np.int32)
+
+    # Bounds on r live on the cumulative-weight scale, not the single-position scale.
+    lb[:p_max] = w_min
+    ub[:p_max] = w_max
+
+    # Binary bounds and integrality for t and y.
+    for idx in list(t_index.values()) + list(y_index.values()):
+        lb[idx] = 0.0
+        ub[idx] = 1.0
+        integrality[idx] = 1
+
+    # Build A in sparse triplet form to avoid dense row allocations.
+    row_idx: List[int] = []
+    col_idx: List[int] = []
+    data: List[float] = []
+    lhs: List[float] = []
+    rhs: List[float] = []
+    n_rows = 0
+
+    def add_row(coeffs: Dict[int, float], lo: float, hi: float) -> None:
+        nonlocal n_rows
+        for j, v in coeffs.items():
+            if v != 0.0:
+                row_idx.append(n_rows)
+                col_idx.append(j)
+                data.append(float(v))
+        lhs.append(lo)
+        rhs.append(hi)
+        n_rows += 1
+
+    # Monotone decreasing thresholds: r[p+1] - r[p] <= 0.
+    for p in range(p_max - 1):
+        add_row({p + 1: 1.0, p: -1.0}, -np.inf, 0.0)
+
+    for q, ex in enumerate(examples):
+        j_q = len(ex.weights)
+        cum_weights = np.cumsum(ex.weights)
+
+        # Force last trigger.
+        add_row({t_index[q, j_q - 1]: 1.0}, 1.0, 1.0)
+
+        for p in range(j_q):
+            t_qp = t_index[q, p]
+            y_qp = y_index[q, p]
+            w_qp = float(cum_weights[p])
+
+            # cumulative_w(p) - r[p] >= -M(1-t)
+            # -> r[p] + M t <= M + cumulative_w(p)
+            add_row({p: 1.0, t_qp: big_m}, -np.inf, big_m + w_qp)
+
+            # cumulative_w(p) - r[p] <= -eps + M t
+            # -> -r[p] - M t <= -eps - cumulative_w(p)
+            add_row({p: -1.0, t_qp: -big_m}, -np.inf, -epsilon - w_qp)
+
+            if p > 0:
+                y_prev = y_index[q, p - 1]
+
+                # y[p] >= y[p-1]
+                add_row({y_qp: 1.0, y_prev: -1.0}, 0.0, np.inf)
+
+                # y[p] >= t[p]
+                add_row({y_qp: 1.0, t_qp: -1.0}, 0.0, np.inf)
+
+                # y[p] <= y[p-1] + t[p]
+                add_row({y_qp: 1.0, y_prev: -1.0, t_qp: -1.0}, -np.inf, 0.0)
+            else:
+                # Base case y[0] = t[0].
+                add_row({y_qp: 1.0, t_qp: -1.0}, 0.0, 0.0)
+
+    A = coo_matrix((np.array(data, dtype=np.float64), (np.array(row_idx), np.array(col_idx))), shape=(n_rows, n_vars)).tocsr()
+    constraints = LinearConstraint(A, np.array(lhs, dtype=np.float64), np.array(rhs, dtype=np.float64))
+    bounds = Bounds(lb, ub)
+
+    result = milp(c=c, constraints=constraints, integrality=integrality, bounds=bounds)
+
+    if not result.success:
+        raise RuntimeError(f"SciPy MILP fallback failed: {result.message}")
+
+    x = result.x
+    thresholds = x[:p_max].astype(np.float64)
+
+    predicted_stop_idx: Dict[str, int] = {}
+    for q, ex in enumerate(examples):
+        j_q = len(ex.weights)
+        pred = j_q - 1
+        if x[y_index[q, 0]] > 0.5:
+            pred = 0
+        else:
+            for p in range(1, j_q):
+                if x[y_index[q, p]] - x[y_index[q, p - 1]] > 0.5:
+                    pred = p
+                    break
+        predicted_stop_idx[ex.session_id] = pred
+
+    objective_hits = -float(result.fun)
+    return thresholds, objective_hits, predicted_stop_idx
 
 
 def compute_vertical_mnl_scaler(
@@ -141,14 +300,11 @@ def solve_first_trigger_stop_ip(
 
     Objective maximizes correctly predicted stop positions.
     """
-    if gp is None or GRB is None:
-        raise ImportError("gurobipy is required for solve_first_trigger_stop_ip.")
-
     if len(examples) == 0:
         raise ValueError("examples cannot be empty.")
 
     p_max = max(len(ex.weights) for ex in examples)
-    all_weights = np.concatenate([ex.weights for ex in examples])
+    all_weights = np.concatenate([np.cumsum(ex.weights) for ex in examples])
 
     w_min = float(all_weights.min())
     w_max = float(all_weights.max())
@@ -156,84 +312,98 @@ def solve_first_trigger_stop_ip(
     if big_m is None:
         big_m = max(1.0, w_max - w_min + 1.0)
 
-    model = gp.Model("stop_position_ip")
-    model.setParam("OutputFlag", 0)
+    if gp is not None and GRB is not None:
+        model = gp.Model("stop_position_ip")
+        model.setParam("OutputFlag", 0)
 
-    r = model.addVars(range(p_max), lb=w_min, ub=w_max, vtype=GRB.CONTINUOUS, name="r")
+        r = model.addVars(range(p_max), lb=w_min, ub=w_max, vtype=GRB.CONTINUOUS, name="r")
 
-    t = {}
-    z = {}
+        t = {}
+        z = {}
 
-    for q, ex in enumerate(examples):
-        j_q = len(ex.weights)
-        for p in range(j_q):
-            t[q, p] = model.addVar(vtype=GRB.BINARY, name=f"t_{q}_{p}")
-            z[q, p] = model.addVar(vtype=GRB.BINARY, name=f"z_{q}_{p}")
+        for q, ex in enumerate(examples):
+            j_q = len(ex.weights)
+            for p in range(j_q):
+                t[q, p] = model.addVar(vtype=GRB.BINARY, name=f"t_{q}_{p}")
+                z[q, p] = model.addVar(vtype=GRB.BINARY, name=f"z_{q}_{p}")
 
-    # Monotone decreasing reservation thresholds by position.
-    for p in range(p_max - 1):
-        model.addConstr(r[p + 1] <= r[p], name=f"mono_{p}")
+        # Monotone decreasing reservation thresholds by position.
+        for p in range(p_max - 1):
+            model.addConstr(r[p + 1] <= r[p], name=f"mono_{p}")
 
-    for q, ex in enumerate(examples):
-        j_q = len(ex.weights)
+        for q, ex in enumerate(examples):
+            j_q = len(ex.weights)
+            cum_weights = np.cumsum(ex.weights)
 
-        # Ensure at least one trigger so each session gets one stop.
-        model.addConstr(t[q, j_q - 1] == 1, name=f"force_last_trigger_{q}")
+            # Ensure at least one trigger so each session gets one stop.
+            model.addConstr(t[q, j_q - 1] == 1, name=f"force_last_trigger_{q}")
 
-        for p in range(j_q):
-            w_qp = float(ex.weights[p])
+            for p in range(j_q):
+                cum_w_qp = float(cum_weights[p])
 
-            # Big-M trigger linearization for t[q,p] ~ 1{w_qp >= r[p]}.
-            model.addConstr(w_qp - r[p] >= -big_m * (1 - t[q, p]), name=f"trig_lb_{q}_{p}")
-            model.addConstr(
-                w_qp - r[p] <= -epsilon + big_m * t[q, p],
-                name=f"trig_ub_{q}_{p}",
-            )
+                # Big-M trigger linearization for t[q,p] ~ 1{sum_{k<=p} w_qk >= r[p]}.
+                model.addConstr(cum_w_qp - r[p] >= -big_m * (1 - t[q, p]), name=f"trig_lb_{q}_{p}")
+                model.addConstr(
+                    cum_w_qp - r[p] <= -epsilon + big_m * t[q, p],
+                    name=f"trig_ub_{q}_{p}",
+                )
 
-            # Stop can only happen at triggered positions.
-            model.addConstr(z[q, p] <= t[q, p], name=f"z_le_t_{q}_{p}")
+                # Stop can only happen at triggered positions.
+                model.addConstr(z[q, p] <= t[q, p], name=f"z_le_t_{q}_{p}")
 
-            # First-trigger logic.
-            if p > 0:
-                prev_sum = gp.quicksum(t[q, k] for k in range(p))
-                for k in range(p):
-                    model.addConstr(z[q, p] <= 1 - t[q, k], name=f"no_prev_{q}_{p}_{k}")
-                model.addConstr(z[q, p] >= t[q, p] - prev_sum, name=f"first_lb_{q}_{p}")
-            else:
-                model.addConstr(z[q, p] >= t[q, p], name=f"first_lb_{q}_{p}")
+                # First-trigger logic.
+                if p > 0:
+                    prev_sum = gp.quicksum(t[q, k] for k in range(p))
+                    for k in range(p):
+                        model.addConstr(z[q, p] <= 1 - t[q, k], name=f"no_prev_{q}_{p}_{k}")
+                    model.addConstr(z[q, p] >= t[q, p] - prev_sum, name=f"first_lb_{q}_{p}")
+                else:
+                    model.addConstr(z[q, p] >= t[q, p], name=f"first_lb_{q}_{p}")
 
-        # Exactly one predicted stop per session.
-        model.addConstr(gp.quicksum(z[q, p] for p in range(j_q)) == 1, name=f"one_stop_{q}")
+            # Exactly one predicted stop per session.
+            model.addConstr(gp.quicksum(z[q, p] for p in range(j_q)) == 1, name=f"one_stop_{q}")
 
-    # Maximize number of correctly predicted stopping points.
-    objective_terms = []
-    for q, ex in enumerate(examples):
-        objective_terms.append(z[q, ex.true_stop_idx])
+        # Maximize number of correctly predicted stopping points.
+        objective_terms = []
+        for q, ex in enumerate(examples):
+            objective_terms.append(z[q, ex.true_stop_idx])
 
-    model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
-    model.optimize()
+        model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
+        model.optimize()
 
-    if model.status != GRB.OPTIMAL:
-        raise RuntimeError(f"Gurobi did not return optimal status. Status code={model.status}")
+        if model.status != GRB.OPTIMAL:
+            raise RuntimeError(f"Gurobi did not return optimal status. Status code={model.status}")
 
-    thresholds = np.array([r[p].X for p in range(p_max)], dtype=np.float64)
+        thresholds = np.array([r[p].X for p in range(p_max)], dtype=np.float64)
 
-    predicted_stop_idx: Dict[str, int] = {}
+        predicted_stop_idx: Dict[str, int] = {}
+        for q, ex in enumerate(examples):
+            j_q = len(ex.weights)
+            pred = None
+
+            for p in range(j_q):
+                if z[q, p].X > 0.5:
+                    pred = p
+                    break
+
+            if pred is None:
+                pred = j_q - 1
+
+            predicted_stop_idx[ex.session_id] = pred
+
+        objective_hits = float(model.objVal)
+    else:
+        thresholds, objective_hits, predicted_stop_idx = _solve_first_trigger_stop_ip_scipy(
+            examples=examples,
+            epsilon=epsilon,
+            big_m=big_m,
+            w_min=w_min,
+            w_max=w_max,
+        )
+
     correct = 0
-
-    for q, ex in enumerate(examples):
-        j_q = len(ex.weights)
-        pred = None
-
-        for p in range(j_q):
-            if z[q, p].X > 0.5:
-                pred = p
-                break
-
-        if pred is None:
-            pred = j_q - 1
-
-        predicted_stop_idx[ex.session_id] = pred
+    for ex in examples:
+        pred = predicted_stop_idx[ex.session_id]
         if pred == ex.true_stop_idx:
             correct += 1
 
@@ -241,7 +411,7 @@ def solve_first_trigger_stop_ip(
 
     return StopIPResult(
         thresholds=thresholds,
-        objective_hits=float(model.objVal),
+        objective_hits=float(objective_hits),
         hit_rate=float(hit_rate),
         predicted_stop_idx=predicted_stop_idx,
     )
