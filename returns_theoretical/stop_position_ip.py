@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -34,73 +33,118 @@ class StopIPResult:
     thresholds: np.ndarray
     objective_hits: float
     hit_rate: float
+    assigned_type_idx: Dict[str, int]
     predicted_stop_idx: Dict[str, int]
 
 
-def _solve_first_trigger_stop_ip_scipy(
+def _prepare_problem_data(
     examples: List[SessionExample],
     epsilon: float,
-    big_m: float,
-    w_min: float,
-    w_max: float,
-) -> Tuple[np.ndarray, float, Dict[str, int]]:
-    """SciPy MILP fallback for environments without Gurobi.
+) -> Tuple[int, List[np.ndarray], np.ndarray, np.ndarray, List[np.ndarray], np.ndarray]:
+    if len(examples) == 0:
+        raise ValueError("examples cannot be empty.")
 
-    Uses an equivalent first-trigger encoding with cumulative trigger variables.
-    This reduces constraint growth from quadratic-in-session-length to linear,
-    which is much more memory efficient on large datasets.
-    """
+    n_pos = max(len(ex.weights) for ex in examples)
+
+    cumulative: List[np.ndarray] = []
+    for ex in examples:
+        w = np.asarray(ex.weights, dtype=np.float64).reshape(-1)
+        if len(w) == 0:
+            raise ValueError("Each session must contain at least one position.")
+        if ex.true_stop_idx < 0 or ex.true_stop_idx >= len(w):
+            raise ValueError("true_stop_idx must be a valid 0-based position index.")
+        cumulative.append(np.cumsum(w))
+
+    r_lb = np.zeros(n_pos, dtype=np.float64)
+    r_ub = np.zeros(n_pos, dtype=np.float64)
+
+    for p in range(n_pos):
+        vals = [cum[p] for cum in cumulative if p < len(cum)]
+        if not vals:
+            raise ValueError("No sessions found for at least one position index.")
+        r_lb[p] = float(np.min(vals))
+        r_ub[p] = float(np.max(vals))
+
+    pre_big_m: List[np.ndarray] = []
+    stop_big_m = np.zeros(len(examples), dtype=np.float64)
+
+    for s, ex in enumerate(examples):
+        t = ex.true_stop_idx
+        cum_s = cumulative[s]
+
+        if t > 0:
+            pre_vals = []
+            for p in range(t):
+                # Tight Big-M so pre-stop constraints relax exactly when x_sk = 0.
+                pre_vals.append(cum_s[p] - r_lb[p] + epsilon)
+            pre_big_m.append(np.asarray(pre_vals, dtype=np.float64))
+        else:
+            pre_big_m.append(np.zeros(0, dtype=np.float64))
+
+        # Tight Big-M so stop constraint relaxes exactly when x_sk = 0.
+        stop_big_m[s] = r_ub[t] - cum_s[t]
+
+    return n_pos, cumulative, r_lb, r_ub, pre_big_m, stop_big_m
+
+
+def _solve_main_stop_ip_scipy(
+    examples: List[SessionExample],
+    n_customer_types: int,
+    epsilon: float,
+) -> Tuple[np.ndarray, float, Dict[str, int], Dict[str, int]]:
     if milp is None or Bounds is None or LinearConstraint is None or coo_matrix is None:
         raise ImportError(
             "No MILP backend available. Install gurobipy or scipy with optimize.milp support."
         )
 
-    p_max = max(len(ex.weights) for ex in examples)
+    n_pos, cumulative, r_lb, r_ub, pre_big_m, stop_big_m = _prepare_problem_data(
+        examples=examples,
+        epsilon=epsilon,
+    )
 
-    # Flat variable layout:
-    # [r_0..r_{p_max-1}, t_(q,p) for all valid pairs, y_(q,p) for all valid pairs]
-    # where y_(q,p) = OR_{k<=p} t_(q,k) (cumulative trigger state).
-    t_index: Dict[Tuple[int, int], int] = {}
-    y_index: Dict[Tuple[int, int], int] = {}
+    n_sessions = len(examples)
 
-    next_idx = p_max
-    for q, ex in enumerate(examples):
-        for p in range(len(ex.weights)):
-            t_index[q, p] = next_idx
+    # Variable layout:
+    # r[p,k] for p in [0, n_pos), k in [0, K)
+    # x[s,k] for s in [0, n_sessions), k in [0, K)
+    r_index: Dict[Tuple[int, int], int] = {}
+    x_index: Dict[Tuple[int, int], int] = {}
+
+    next_idx = 0
+    for p in range(n_pos):
+        for k in range(n_customer_types):
+            r_index[p, k] = next_idx
             next_idx += 1
 
-    for q, ex in enumerate(examples):
-        for p in range(len(ex.weights)):
-            y_index[q, p] = next_idx
+    for s in range(n_sessions):
+        for k in range(n_customer_types):
+            x_index[s, k] = next_idx
             next_idx += 1
 
     n_vars = next_idx
 
-    # Objective: maximize hits at true first-trigger stop.
-    # If s_q is true stop: hit_q = y[q,s_q] - y[q,s_q-1] (with y[q,-1] := 0).
-    # milp minimizes, so minimize -sum_q hit_q.
     c = np.zeros(n_vars, dtype=np.float64)
-    for q, ex in enumerate(examples):
-        s_q = ex.true_stop_idx
-        c[y_index[q, s_q]] -= 1.0
-        if s_q > 0:
-            c[y_index[q, s_q - 1]] += 1.0
+    for s in range(n_sessions):
+        for k in range(n_customer_types):
+            c[x_index[s, k]] = -1.0
 
     lb = np.full(n_vars, -np.inf, dtype=np.float64)
     ub = np.full(n_vars, np.inf, dtype=np.float64)
     integrality = np.zeros(n_vars, dtype=np.int32)
 
-    # Bounds on r live on the cumulative-weight scale, not the single-position scale.
-    lb[:p_max] = w_min
-    ub[:p_max] = w_max
+    for p in range(n_pos):
+        for k in range(n_customer_types):
+            idx = r_index[p, k]
+            lb[idx] = r_lb[p]
+            ub[idx] = r_ub[p]
 
-    # Binary bounds and integrality for t and y.
-    for idx in list(t_index.values()) + list(y_index.values()):
-        lb[idx] = 0.0
-        ub[idx] = 1.0
-        integrality[idx] = 1
+    for s in range(n_sessions):
+        for k in range(n_customer_types):
+            idx = x_index[s, k]
+            lb[idx] = 0.0
+            ub[idx] = 1.0
+            integrality[idx] = 1
 
-    # Build A in sparse triplet form to avoid dense row allocations.
     row_idx: List[int] = []
     col_idx: List[int] = []
     data: List[float] = []
@@ -119,72 +163,210 @@ def _solve_first_trigger_stop_ip_scipy(
         rhs.append(hi)
         n_rows += 1
 
-    # Monotone decreasing thresholds: r[p+1] - r[p] <= 0.
-    for p in range(p_max - 1):
-        add_row({p + 1: 1.0, p: -1.0}, -np.inf, 0.0)
+    # (1) Monotonicity: r[p,k] >= r[p+1,k].
+    for k in range(n_customer_types):
+        for p in range(n_pos - 1):
+            add_row(
+                {
+                    r_index[p, k]: 1.0,
+                    r_index[p + 1, k]: -1.0,
+                },
+                0.0,
+                np.inf,
+            )
 
-    for q, ex in enumerate(examples):
-        j_q = len(ex.weights)
-        cum_weights = np.cumsum(ex.weights)
+    # (2), (3), (4)
+    for s, ex in enumerate(examples):
+        t = ex.true_stop_idx
+        cum_s = cumulative[s]
 
-        # Force last trigger.
-        add_row({t_index[q, j_q - 1]: 1.0}, 1.0, 1.0)
+        for k in range(n_customer_types):
+            x_sk = x_index[s, k]
 
-        for p in range(j_q):
-            t_qp = t_index[q, p]
-            y_qp = y_index[q, p]
-            w_qp = float(cum_weights[p])
+            # (2) Pre-stopping constraints for p < T_s:
+            # W_sp <= r_pk - eps + M_pre(1 - x_sk)
+            # <=> -r_pk + M_pre x_sk <= M_pre - W_sp - eps
+            for p in range(t):
+                m_pre = float(pre_big_m[s][p])
+                add_row(
+                    {
+                        r_index[p, k]: -1.0,
+                        x_sk: m_pre,
+                    },
+                    -np.inf,
+                    m_pre - float(cum_s[p]) - epsilon,
+                )
 
-            # cumulative_w(p) - r[p] >= -M(1-t)
-            # -> r[p] + M t <= M + cumulative_w(p)
-            add_row({p: 1.0, t_qp: big_m}, -np.inf, big_m + w_qp)
+            # (3) Stopping constraint at T_s:
+            # W_sT >= r_Tk - M_stop(1 - x_sk)
+            # <=> r_Tk - M_stop x_sk <= W_sT + M_stop
+            m_stop = float(stop_big_m[s])
+            add_row(
+                {
+                    r_index[t, k]: 1.0,
+                    x_sk: -m_stop,
+                },
+                -np.inf,
+                float(cum_s[t]) + m_stop,
+            )
 
-            # cumulative_w(p) - r[p] <= -eps + M t
-            # -> -r[p] - M t <= -eps - cumulative_w(p)
-            add_row({p: -1.0, t_qp: -big_m}, -np.inf, -epsilon - w_qp)
+        # (4) At most one type can explain each session.
+        add_row(
+            {x_index[s, k]: 1.0 for k in range(n_customer_types)},
+            -np.inf,
+            1.0,
+        )
 
-            if p > 0:
-                y_prev = y_index[q, p - 1]
+    # (7) Symmetry breaking: r[0,k] >= r[0,k+1].
+    for k in range(n_customer_types - 1):
+        add_row(
+            {
+                r_index[0, k]: 1.0,
+                r_index[0, k + 1]: -1.0,
+            },
+            0.0,
+            np.inf,
+        )
 
-                # y[p] >= y[p-1]
-                add_row({y_qp: 1.0, y_prev: -1.0}, 0.0, np.inf)
+    A = coo_matrix(
+        (
+            np.array(data, dtype=np.float64),
+            (np.array(row_idx), np.array(col_idx)),
+        ),
+        shape=(n_rows, n_vars),
+    ).tocsr()
 
-                # y[p] >= t[p]
-                add_row({y_qp: 1.0, t_qp: -1.0}, 0.0, np.inf)
-
-                # y[p] <= y[p-1] + t[p]
-                add_row({y_qp: 1.0, y_prev: -1.0, t_qp: -1.0}, -np.inf, 0.0)
-            else:
-                # Base case y[0] = t[0].
-                add_row({y_qp: 1.0, t_qp: -1.0}, 0.0, 0.0)
-
-    A = coo_matrix((np.array(data, dtype=np.float64), (np.array(row_idx), np.array(col_idx))), shape=(n_rows, n_vars)).tocsr()
-    constraints = LinearConstraint(A, np.array(lhs, dtype=np.float64), np.array(rhs, dtype=np.float64))
+    constraints = LinearConstraint(
+        A,
+        np.array(lhs, dtype=np.float64),
+        np.array(rhs, dtype=np.float64),
+    )
     bounds = Bounds(lb, ub)
 
     result = milp(c=c, constraints=constraints, integrality=integrality, bounds=bounds)
-
     if not result.success:
-        raise RuntimeError(f"SciPy MILP fallback failed: {result.message}")
+        raise RuntimeError(f"SciPy MILP failed: {result.message}")
 
-    x = result.x
-    thresholds = x[:p_max].astype(np.float64)
+    x_opt = result.x
+    thresholds = np.zeros((n_pos, n_customer_types), dtype=np.float64)
+    for p in range(n_pos):
+        for k in range(n_customer_types):
+            thresholds[p, k] = x_opt[r_index[p, k]]
 
+    assigned_type_idx: Dict[str, int] = {}
     predicted_stop_idx: Dict[str, int] = {}
-    for q, ex in enumerate(examples):
-        j_q = len(ex.weights)
-        pred = j_q - 1
-        if x[y_index[q, 0]] > 0.5:
-            pred = 0
-        else:
-            for p in range(1, j_q):
-                if x[y_index[q, p]] - x[y_index[q, p - 1]] > 0.5:
-                    pred = p
-                    break
-        predicted_stop_idx[ex.session_id] = pred
+
+    for s, ex in enumerate(examples):
+        chosen = -1
+        for k in range(n_customer_types):
+            if x_opt[x_index[s, k]] > 0.5:
+                chosen = k
+                break
+        assigned_type_idx[ex.session_id] = chosen
+        predicted_stop_idx[ex.session_id] = ex.true_stop_idx if chosen >= 0 else -1
 
     objective_hits = -float(result.fun)
-    return thresholds, objective_hits, predicted_stop_idx
+    return thresholds, objective_hits, assigned_type_idx, predicted_stop_idx
+
+
+def _solve_main_stop_ip_gurobi(
+    examples: List[SessionExample],
+    n_customer_types: int,
+    epsilon: float,
+) -> Tuple[np.ndarray, float, Dict[str, int], Dict[str, int]]:
+    if gp is None or GRB is None:
+        raise ImportError("gurobipy is not available")
+
+    n_pos, cumulative, r_lb, r_ub, pre_big_m, stop_big_m = _prepare_problem_data(
+        examples=examples,
+        epsilon=epsilon,
+    )
+
+    n_sessions = len(examples)
+
+    model = gp.Model("stop_position_ip_main")
+    model.setParam("OutputFlag", 0)
+
+    r = model.addVars(
+        range(n_pos),
+        range(n_customer_types),
+        lb={(p, k): r_lb[p] for p in range(n_pos) for k in range(n_customer_types)},
+        ub={(p, k): r_ub[p] for p in range(n_pos) for k in range(n_customer_types)},
+        vtype=GRB.CONTINUOUS,
+        name="r",
+    )
+
+    x = model.addVars(
+        range(n_sessions),
+        range(n_customer_types),
+        vtype=GRB.BINARY,
+        name="x",
+    )
+
+    # (1) Monotonicity: r[p,k] >= r[p+1,k].
+    for k in range(n_customer_types):
+        for p in range(n_pos - 1):
+            model.addConstr(r[p, k] >= r[p + 1, k], name=f"mono_{p}_{k}")
+
+    # (2), (3), (4)
+    for s, ex in enumerate(examples):
+        t = ex.true_stop_idx
+        cum_s = cumulative[s]
+
+        for k in range(n_customer_types):
+            # (2) Pre-stopping constraints.
+            for p in range(t):
+                m_pre = float(pre_big_m[s][p])
+                model.addConstr(
+                    cum_s[p] <= r[p, k] - epsilon + m_pre * (1.0 - x[s, k]),
+                    name=f"pre_{s}_{p}_{k}",
+                )
+
+            # (3) Stopping condition at observed stop.
+            m_stop = float(stop_big_m[s])
+            model.addConstr(
+                cum_s[t] >= r[t, k] - m_stop * (1.0 - x[s, k]),
+                name=f"stop_{s}_{k}",
+            )
+
+        # (4) At most one type can explain session s.
+        model.addConstr(
+            gp.quicksum(x[s, k] for k in range(n_customer_types)) <= 1,
+            name=f"one_type_{s}",
+        )
+
+    # (7) Symmetry breaking.
+    for k in range(n_customer_types - 1):
+        model.addConstr(r[0, k] >= r[0, k + 1], name=f"sym_{k}")
+
+    model.setObjective(
+        gp.quicksum(x[s, k] for s in range(n_sessions) for k in range(n_customer_types)),
+        GRB.MAXIMIZE,
+    )
+    model.optimize()
+
+    if model.status != GRB.OPTIMAL:
+        raise RuntimeError(f"Gurobi did not return optimal status. Status code={model.status}")
+
+    thresholds = np.zeros((n_pos, n_customer_types), dtype=np.float64)
+    for p in range(n_pos):
+        for k in range(n_customer_types):
+            thresholds[p, k] = r[p, k].X
+
+    assigned_type_idx: Dict[str, int] = {}
+    predicted_stop_idx: Dict[str, int] = {}
+
+    for s, ex in enumerate(examples):
+        chosen = -1
+        for k in range(n_customer_types):
+            if x[s, k].X > 0.5:
+                chosen = k
+                break
+        assigned_type_idx[ex.session_id] = chosen
+        predicted_stop_idx[ex.session_id] = ex.true_stop_idx if chosen >= 0 else -1
+
+    objective_hits = float(model.objVal)
+    return thresholds, objective_hits, assigned_type_idx, predicted_stop_idx
 
 
 def compute_vertical_mnl_scaler(
@@ -194,15 +376,10 @@ def compute_vertical_mnl_scaler(
     position_col: str = "position",
     click_col: str = "click_bool",
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Replicates the notebook's mean/std logic used before MNL estimation.
-
-    The scaler is computed on padded arrays after truncating each session to its deepest click,
-    matching the data transformation in vertical_diff_model.ipynb.
-    """
+    """Rebuild the notebook scaler used before MNL estimation."""
     offered = []
 
-    for session_id, group in train_data.groupby(session_col):
-        _ = session_id
+    for _, group in train_data.groupby(session_col):
         g = group.sort_values(position_col)
 
         if g[click_col].sum() == 0:
@@ -211,14 +388,14 @@ def compute_vertical_mnl_scaler(
         deepest_click = g.loc[g[click_col] == 1, position_col].max()
         g = g[g[position_col] <= deepest_click]
 
-        x = g[feature_list].values.astype(np.float32)
+        x = g[feature_list].values.astype(np.float64)
         offered.append(x)
 
     if not offered:
         raise ValueError("No sessions with clicks were found; cannot compute scaler.")
 
     max_j = max(x.shape[0] for x in offered)
-    x_pad = np.zeros((len(offered), max_j, len(feature_list)), dtype=np.float32)
+    x_pad = np.zeros((len(offered), max_j, len(feature_list)), dtype=np.float64)
 
     for i, x in enumerate(offered):
         j = x.shape[0]
@@ -227,7 +404,7 @@ def compute_vertical_mnl_scaler(
     mean = x_pad.mean(axis=(0, 1))
     std = x_pad.std(axis=(0, 1)) + 1e-8
 
-    return mean.astype(np.float64), std.astype(np.float64)
+    return mean, std
 
 
 def build_session_examples_from_mnl(
@@ -240,10 +417,9 @@ def build_session_examples_from_mnl(
     position_col: str = "position",
     click_col: str = "click_bool",
 ) -> List[SessionExample]:
-    """Builds session-level MNL weights and observed stopping labels.
+    """Build session-level w_si and observed stopping labels.
 
-    True stop index is the deepest clicked position after sorting by rank position.
-    Returns 0-based position indices in each truncated session.
+    In the main formulation, w_si is the linear index h_si dot beta_hat.
     """
     beta = np.asarray(beta_hat, dtype=np.float64).reshape(-1)
     mean = np.asarray(mean, dtype=np.float64).reshape(-1)
@@ -266,10 +442,8 @@ def build_session_examples_from_mnl(
         x_raw = g[feature_list].values.astype(np.float64)
         x_scaled = (x_raw - mean.reshape(1, -1)) / std.reshape(1, -1)
 
-        utilities = x_scaled @ beta
-        weights = np.exp(utilities)
+        weights = x_scaled @ beta
 
-        # deepest click is the observed stop by design
         local_stop = int(np.where(g[position_col].values == deepest_click_rank)[0][0])
 
         examples.append(
@@ -289,130 +463,36 @@ def build_session_examples_from_mnl(
 def solve_first_trigger_stop_ip(
     examples: List[SessionExample],
     epsilon: float = 1e-6,
-    big_m: float = None,
+    n_customer_types: int = 1,
 ) -> StopIPResult:
-    """First IP prototype with decreasing position thresholds.
+    """Solve the main IP formulation from AI-IP-Notes.
 
-    Decision variables:
-    - r_p: reservation threshold by position p
-    - t_{q,p}: trigger if session q, position p has weight above threshold
-    - z_{q,p}: predicted stop position (first triggered position)
-
-    Objective maximizes correctly predicted stop positions.
+    Even though this keeps the legacy function name for compatibility,
+    it now solves the K-type formulation with variables r_pk and x_sk.
     """
-    if len(examples) == 0:
-        raise ValueError("examples cannot be empty.")
-
-    p_max = max(len(ex.weights) for ex in examples)
-    all_weights = np.concatenate([np.cumsum(ex.weights) for ex in examples])
-
-    w_min = float(all_weights.min())
-    w_max = float(all_weights.max())
-
-    if big_m is None:
-        big_m = max(1.0, w_max - w_min + 1.0)
+    if n_customer_types < 1:
+        raise ValueError("n_customer_types must be >= 1.")
 
     if gp is not None and GRB is not None:
-        model = gp.Model("stop_position_ip")
-        model.setParam("OutputFlag", 0)
-
-        r = model.addVars(range(p_max), lb=w_min, ub=w_max, vtype=GRB.CONTINUOUS, name="r")
-
-        t = {}
-        z = {}
-
-        for q, ex in enumerate(examples):
-            j_q = len(ex.weights)
-            for p in range(j_q):
-                t[q, p] = model.addVar(vtype=GRB.BINARY, name=f"t_{q}_{p}")
-                z[q, p] = model.addVar(vtype=GRB.BINARY, name=f"z_{q}_{p}")
-
-        # Monotone decreasing reservation thresholds by position.
-        for p in range(p_max - 1):
-            model.addConstr(r[p + 1] <= r[p], name=f"mono_{p}")
-
-        for q, ex in enumerate(examples):
-            j_q = len(ex.weights)
-            cum_weights = np.cumsum(ex.weights)
-
-            # Ensure at least one trigger so each session gets one stop.
-            model.addConstr(t[q, j_q - 1] == 1, name=f"force_last_trigger_{q}")
-
-            for p in range(j_q):
-                cum_w_qp = float(cum_weights[p])
-
-                # Big-M trigger linearization for t[q,p] ~ 1{sum_{k<=p} w_qk >= r[p]}.
-                model.addConstr(cum_w_qp - r[p] >= -big_m * (1 - t[q, p]), name=f"trig_lb_{q}_{p}")
-                model.addConstr(
-                    cum_w_qp - r[p] <= -epsilon + big_m * t[q, p],
-                    name=f"trig_ub_{q}_{p}",
-                )
-
-                # Stop can only happen at triggered positions.
-                model.addConstr(z[q, p] <= t[q, p], name=f"z_le_t_{q}_{p}")
-
-                # First-trigger logic.
-                if p > 0:
-                    prev_sum = gp.quicksum(t[q, k] for k in range(p))
-                    for k in range(p):
-                        model.addConstr(z[q, p] <= 1 - t[q, k], name=f"no_prev_{q}_{p}_{k}")
-                    model.addConstr(z[q, p] >= t[q, p] - prev_sum, name=f"first_lb_{q}_{p}")
-                else:
-                    model.addConstr(z[q, p] >= t[q, p], name=f"first_lb_{q}_{p}")
-
-            # Exactly one predicted stop per session.
-            model.addConstr(gp.quicksum(z[q, p] for p in range(j_q)) == 1, name=f"one_stop_{q}")
-
-        # Maximize number of correctly predicted stopping points.
-        objective_terms = []
-        for q, ex in enumerate(examples):
-            objective_terms.append(z[q, ex.true_stop_idx])
-
-        model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
-        model.optimize()
-
-        if model.status != GRB.OPTIMAL:
-            raise RuntimeError(f"Gurobi did not return optimal status. Status code={model.status}")
-
-        thresholds = np.array([r[p].X for p in range(p_max)], dtype=np.float64)
-
-        predicted_stop_idx: Dict[str, int] = {}
-        for q, ex in enumerate(examples):
-            j_q = len(ex.weights)
-            pred = None
-
-            for p in range(j_q):
-                if z[q, p].X > 0.5:
-                    pred = p
-                    break
-
-            if pred is None:
-                pred = j_q - 1
-
-            predicted_stop_idx[ex.session_id] = pred
-
-        objective_hits = float(model.objVal)
-    else:
-        thresholds, objective_hits, predicted_stop_idx = _solve_first_trigger_stop_ip_scipy(
+        thresholds, objective_hits, assigned_type_idx, predicted_stop_idx = _solve_main_stop_ip_gurobi(
             examples=examples,
+            n_customer_types=n_customer_types,
             epsilon=epsilon,
-            big_m=big_m,
-            w_min=w_min,
-            w_max=w_max,
+        )
+    else:
+        thresholds, objective_hits, assigned_type_idx, predicted_stop_idx = _solve_main_stop_ip_scipy(
+            examples=examples,
+            n_customer_types=n_customer_types,
+            epsilon=epsilon,
         )
 
-    correct = 0
-    for ex in examples:
-        pred = predicted_stop_idx[ex.session_id]
-        if pred == ex.true_stop_idx:
-            correct += 1
-
-    hit_rate = correct / len(examples)
+    hit_rate = float(objective_hits) / float(len(examples))
 
     return StopIPResult(
         thresholds=thresholds,
         objective_hits=float(objective_hits),
-        hit_rate=float(hit_rate),
+        hit_rate=hit_rate,
+        assigned_type_idx=assigned_type_idx,
         predicted_stop_idx=predicted_stop_idx,
     )
 
@@ -421,6 +501,8 @@ def fit_stop_ip_from_notebook_outputs(
     train_data: pd.DataFrame,
     feature_list: List[str],
     beta_hat: np.ndarray,
+    n_customer_types: int = 1,
+    epsilon: float = 1e-6,
     session_col: str = "srch_id",
     position_col: str = "position",
     click_col: str = "click_bool",
@@ -429,8 +511,8 @@ def fit_stop_ip_from_notebook_outputs(
 
     Steps:
     1) Rebuild the same scaler used in MNL estimation transformation
-    2) Build per-session MNL weights
-    3) Solve first-trigger stop IP
+    2) Build per-session linear indices w_si = h_si dot beta_hat
+    3) Solve the main K-type stop-position IP
     """
     mean, std = compute_vertical_mnl_scaler(
         train_data=train_data,
@@ -451,5 +533,10 @@ def fit_stop_ip_from_notebook_outputs(
         click_col=click_col,
     )
 
-    result = solve_first_trigger_stop_ip(examples)
+    result = solve_first_trigger_stop_ip(
+        examples=examples,
+        epsilon=epsilon,
+        n_customer_types=n_customer_types,
+    )
+
     return result, examples, mean, std
