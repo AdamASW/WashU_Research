@@ -91,6 +91,7 @@ def _solve_main_stop_ip_scipy(
     examples: List[SessionExample],
     n_customer_types: int,
     epsilon: float,
+    objective_type: str,
 ) -> Tuple[np.ndarray, float, Dict[str, int], Dict[str, int]]:
     if milp is None or Bounds is None or LinearConstraint is None or coo_matrix is None:
         raise ImportError(
@@ -107,8 +108,10 @@ def _solve_main_stop_ip_scipy(
     # Variable layout:
     # r[p,k] for p in [0, n_pos), k in [0, K)
     # x[s,k] for s in [0, n_sessions), k in [0, K)
+    # z[s]   for s in [0, n_sessions) only when objective_type == "coverage"
     r_index: Dict[Tuple[int, int], int] = {}
     x_index: Dict[Tuple[int, int], int] = {}
+    z_index: Dict[int, int] = {}
 
     next_idx = 0
     for p in range(n_pos):
@@ -121,12 +124,21 @@ def _solve_main_stop_ip_scipy(
             x_index[s, k] = next_idx
             next_idx += 1
 
+    if objective_type == "coverage":
+        for s in range(n_sessions):
+            z_index[s] = next_idx
+            next_idx += 1
+
     n_vars = next_idx
 
     c = np.zeros(n_vars, dtype=np.float64)
-    for s in range(n_sessions):
-        for k in range(n_customer_types):
-            c[x_index[s, k]] = -1.0
+    if objective_type == "segmentation":
+        for s in range(n_sessions):
+            for k in range(n_customer_types):
+                c[x_index[s, k]] = -1.0
+    else:
+        for s in range(n_sessions):
+            c[z_index[s]] = -1.0
 
     lb = np.full(n_vars, -np.inf, dtype=np.float64)
     ub = np.full(n_vars, np.inf, dtype=np.float64)
@@ -141,6 +153,13 @@ def _solve_main_stop_ip_scipy(
     for s in range(n_sessions):
         for k in range(n_customer_types):
             idx = x_index[s, k]
+            lb[idx] = 0.0
+            ub[idx] = 1.0
+            integrality[idx] = 1
+
+    if objective_type == "coverage":
+        for s in range(n_sessions):
+            idx = z_index[s]
             lb[idx] = 0.0
             ub[idx] = 1.0
             integrality[idx] = 1
@@ -175,7 +194,7 @@ def _solve_main_stop_ip_scipy(
                 np.inf,
             )
 
-    # (2), (3), (4)
+    # (2), (3), and objective-type linking constraints.
     for s, ex in enumerate(examples):
         t = ex.true_stop_idx
         cum_s = cumulative[s]
@@ -210,12 +229,24 @@ def _solve_main_stop_ip_scipy(
                 float(cum_s[t]) + m_stop,
             )
 
-        # (4) At most one type can explain each session.
-        add_row(
-            {x_index[s, k]: 1.0 for k in range(n_customer_types)},
-            -np.inf,
-            1.0,
-        )
+        if objective_type == "segmentation":
+            # (4) At most one type can explain each session.
+            add_row(
+                {x_index[s, k]: 1.0 for k in range(n_customer_types)},
+                -np.inf,
+                1.0,
+            )
+        else:
+            # Coverage model:
+            # Constraint 2: sum_k x_sk <= K * z_s
+            coverage_coeffs = {x_index[s, k]: 1.0 for k in range(n_customer_types)}
+            coverage_coeffs[z_index[s]] = -float(n_customer_types)
+            add_row(coverage_coeffs, -np.inf, 0.0)
+
+            # Constraint 3: z_s <= sum_k x_sk  <=>  z_s - sum_k x_sk <= 0
+            link_coeffs = {x_index[s, k]: -1.0 for k in range(n_customer_types)}
+            link_coeffs[z_index[s]] = 1.0
+            add_row(link_coeffs, -np.inf, 0.0)
 
     # (7) Symmetry breaking: r[0,k] >= r[0,k+1].
     for k in range(n_customer_types - 1):
@@ -273,6 +304,7 @@ def _solve_main_stop_ip_gurobi(
     examples: List[SessionExample],
     n_customer_types: int,
     epsilon: float,
+    objective_type: str,
 ) -> Tuple[np.ndarray, float, Dict[str, int], Dict[str, int]]:
     if gp is None or GRB is None:
         raise ImportError("gurobipy is not available")
@@ -303,12 +335,16 @@ def _solve_main_stop_ip_gurobi(
         name="x",
     )
 
+    z = None
+    if objective_type == "coverage":
+        z = model.addVars(range(n_sessions), vtype=GRB.BINARY, name="z")
+
     # (1) Monotonicity: r[p,k] >= r[p+1,k].
     for k in range(n_customer_types):
         for p in range(n_pos - 1):
             model.addConstr(r[p, k] >= r[p + 1, k], name=f"mono_{p}_{k}")
 
-    # (2), (3), (4)
+    # (2), (3), and objective-type linking constraints.
     for s, ex in enumerate(examples):
         t = ex.true_stop_idx
         cum_s = cumulative[s]
@@ -329,20 +365,36 @@ def _solve_main_stop_ip_gurobi(
                 name=f"stop_{s}_{k}",
             )
 
-        # (4) At most one type can explain session s.
-        model.addConstr(
-            gp.quicksum(x[s, k] for k in range(n_customer_types)) <= 1,
-            name=f"one_type_{s}",
-        )
+        if objective_type == "segmentation":
+            # (4) At most one type can explain session s.
+            model.addConstr(
+                gp.quicksum(x[s, k] for k in range(n_customer_types)) <= 1,
+                name=f"one_type_{s}",
+            )
+        else:
+            # Coverage model:
+            # Constraint 2: sum_k x_sk <= K * z_s
+            model.addConstr(
+                gp.quicksum(x[s, k] for k in range(n_customer_types)) <= n_customer_types * z[s],
+                name=f"coverage_big_m_{s}",
+            )
+            # Constraint 3: z_s <= sum_k x_sk
+            model.addConstr(
+                z[s] <= gp.quicksum(x[s, k] for k in range(n_customer_types)),
+                name=f"coverage_link_{s}",
+            )
 
     # (7) Symmetry breaking.
     for k in range(n_customer_types - 1):
         model.addConstr(r[0, k] >= r[0, k + 1], name=f"sym_{k}")
 
-    model.setObjective(
-        gp.quicksum(x[s, k] for s in range(n_sessions) for k in range(n_customer_types)),
-        GRB.MAXIMIZE,
-    )
+    if objective_type == "segmentation":
+        model.setObjective(
+            gp.quicksum(x[s, k] for s in range(n_sessions) for k in range(n_customer_types)),
+            GRB.MAXIMIZE,
+        )
+    else:
+        model.setObjective(gp.quicksum(z[s] for s in range(n_sessions)), GRB.MAXIMIZE)
     model.optimize()
 
     if model.status != GRB.OPTIMAL:
@@ -464,6 +516,7 @@ def solve_first_trigger_stop_ip(
     examples: List[SessionExample],
     epsilon: float = 1e-6,
     n_customer_types: int = 1,
+    objective_type: str = "segmentation",
 ) -> StopIPResult:
     """Solve the main IP formulation from AI-IP-Notes.
 
@@ -472,18 +525,22 @@ def solve_first_trigger_stop_ip(
     """
     if n_customer_types < 1:
         raise ValueError("n_customer_types must be >= 1.")
+    if objective_type not in {"segmentation", "coverage"}:
+        raise ValueError("objective_type must be one of {'segmentation', 'coverage'}.")
 
     if gp is not None and GRB is not None:
         thresholds, objective_hits, assigned_type_idx, predicted_stop_idx = _solve_main_stop_ip_gurobi(
             examples=examples,
             n_customer_types=n_customer_types,
             epsilon=epsilon,
+            objective_type=objective_type,
         )
     else:
         thresholds, objective_hits, assigned_type_idx, predicted_stop_idx = _solve_main_stop_ip_scipy(
             examples=examples,
             n_customer_types=n_customer_types,
             epsilon=epsilon,
+            objective_type=objective_type,
         )
 
     hit_rate = float(objective_hits) / float(len(examples))
@@ -503,6 +560,7 @@ def fit_stop_ip_from_notebook_outputs(
     beta_hat: np.ndarray,
     n_customer_types: int = 1,
     epsilon: float = 1e-6,
+    objective_type: str = "segmentation",
     session_col: str = "srch_id",
     position_col: str = "position",
     click_col: str = "click_bool",
@@ -537,6 +595,7 @@ def fit_stop_ip_from_notebook_outputs(
         examples=examples,
         epsilon=epsilon,
         n_customer_types=n_customer_types,
+        objective_type=objective_type,
     )
 
     return result, examples, mean, std
