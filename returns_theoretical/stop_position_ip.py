@@ -37,9 +37,61 @@ class StopIPResult:
     predicted_stop_idx: Dict[str, int]
 
 
+def _diagnose_monotone_bounds_nonincreasing(
+    r_lb: np.ndarray,
+    r_ub: np.ndarray,
+    max_rows: int = 10,
+) -> Dict[str, object]:
+    """Check feasibility of interval bounds under r[p] >= r[p+1].
+
+    For nonincreasing thresholds, a necessary and sufficient condition is
+    ub[p] >= max_{j>=p}(lb[j]) for every position p.
+    """
+    lb = np.asarray(r_lb, dtype=np.float64).reshape(-1)
+    ub = np.asarray(r_ub, dtype=np.float64).reshape(-1)
+
+    suffix_lb_max = np.maximum.accumulate(lb[::-1])[::-1]
+    violations = np.where(ub < suffix_lb_max)[0]
+
+    rows = []
+    for p in violations[:max_rows]:
+        rows.append(
+            {
+                "position": int(p),
+                "lb": float(lb[p]),
+                "ub": float(ub[p]),
+                "required_min_ub": float(suffix_lb_max[p]),
+            }
+        )
+
+    return {
+        "n_positions": int(len(lb)),
+        "n_violations": int(len(violations)),
+        "violating_positions": violations.astype(int).tolist(),
+        "sample_rows": rows,
+    }
+
+
+def _print_bounds_diagnostic(diag: Dict[str, object]) -> None:
+    print(
+        "Bounds diagnostic (monotone nonincreasing r[p] >= r[p+1]): "
+        f"positions={diag['n_positions']}, violations={diag['n_violations']}"
+    )
+    rows = diag.get("sample_rows", [])
+    if rows:
+        print("First violating positions (0-based):")
+        for row in rows:
+            print(
+                "  p={position}, lb={lb:.6f}, ub={ub:.6f}, "
+                "required ub >= {required_min_ub:.6f}".format(**row)
+            )
+
+
 def _prepare_problem_data(
     examples: List[SessionExample],
     epsilon: float,
+    r_lower_bound: float = None,
+    r_upper_bound: float = None,
 ) -> Tuple[int, List[np.ndarray], np.ndarray, np.ndarray, List[np.ndarray], np.ndarray]:
     if len(examples) == 0:
         raise ValueError("examples cannot be empty.")
@@ -55,15 +107,27 @@ def _prepare_problem_data(
             raise ValueError("true_stop_idx must be a valid 0-based position index.")
         cumulative.append(np.cumsum(w))
 
-    r_lb = np.zeros(n_pos, dtype=np.float64)
-    r_ub = np.zeros(n_pos, dtype=np.float64)
+    if (r_lower_bound is None) != (r_upper_bound is None):
+        raise ValueError("Provide both r_lower_bound and r_upper_bound, or neither.")
 
-    for p in range(n_pos):
-        vals = [cum[p] for cum in cumulative if p < len(cum)]
-        if not vals:
-            raise ValueError("No sessions found for at least one position index.")
-        r_lb[p] = float(np.min(vals))
-        r_ub[p] = float(np.max(vals))
+    if r_lower_bound is not None and r_upper_bound is not None:
+        if not np.isfinite(r_lower_bound) or not np.isfinite(r_upper_bound):
+            raise ValueError("Fixed bounds must be finite floats.")
+        if float(r_lower_bound) > float(r_upper_bound):
+            raise ValueError("r_lower_bound must be <= r_upper_bound.")
+
+        r_lb = np.full(n_pos, float(r_lower_bound), dtype=np.float64)
+        r_ub = np.full(n_pos, float(r_upper_bound), dtype=np.float64)
+    else:
+        r_lb = np.zeros(n_pos, dtype=np.float64)
+        r_ub = np.zeros(n_pos, dtype=np.float64)
+
+        for p in range(n_pos):
+            vals = [cum[p] for cum in cumulative if p < len(cum)]
+            if not vals:
+                raise ValueError("No sessions found for at least one position index.")
+            r_lb[p] = float(np.min(vals))
+            r_ub[p] = float(np.max(vals))
 
     pre_big_m: List[np.ndarray] = []
     stop_big_m = np.zeros(len(examples), dtype=np.float64)
@@ -92,6 +156,8 @@ def _solve_main_stop_ip_scipy(
     n_customer_types: int,
     epsilon: float,
     objective_type: str,
+    r_lower_bound: float = None,
+    r_upper_bound: float = None,
 ) -> Tuple[np.ndarray, float, Dict[str, int], Dict[str, int]]:
     if milp is None or Bounds is None or LinearConstraint is None or coo_matrix is None:
         raise ImportError(
@@ -101,7 +167,18 @@ def _solve_main_stop_ip_scipy(
     n_pos, cumulative, r_lb, r_ub, pre_big_m, stop_big_m = _prepare_problem_data(
         examples=examples,
         epsilon=epsilon,
+        r_lower_bound=r_lower_bound,
+        r_upper_bound=r_upper_bound,
     )
+
+    bounds_diag = _diagnose_monotone_bounds_nonincreasing(r_lb=r_lb, r_ub=r_ub)
+    _print_bounds_diagnostic(bounds_diag)
+    if bounds_diag["n_violations"] > 0:
+        raise RuntimeError(
+            "Infeasible position-level bounds under monotone nonincreasing thresholds "
+            "(r[p] >= r[p+1]) before MILP solve. "
+            "See printed bounds diagnostic for violating positions."
+        )
 
     n_sessions = len(examples)
 
@@ -223,7 +300,7 @@ def _solve_main_stop_ip_scipy(
             add_row(
                 {
                     r_index[t, k]: 1.0,
-                    x_sk: -m_stop,
+                    x_sk: m_stop,
                 },
                 -np.inf,
                 float(cum_s[t]) + m_stop,
@@ -305,6 +382,8 @@ def _solve_main_stop_ip_gurobi(
     n_customer_types: int,
     epsilon: float,
     objective_type: str,
+    r_lower_bound: float = None,
+    r_upper_bound: float = None,
 ) -> Tuple[np.ndarray, float, Dict[str, int], Dict[str, int]]:
     if gp is None or GRB is None:
         raise ImportError("gurobipy is not available")
@@ -312,7 +391,18 @@ def _solve_main_stop_ip_gurobi(
     n_pos, cumulative, r_lb, r_ub, pre_big_m, stop_big_m = _prepare_problem_data(
         examples=examples,
         epsilon=epsilon,
+        r_lower_bound=r_lower_bound,
+        r_upper_bound=r_upper_bound,
     )
+
+    bounds_diag = _diagnose_monotone_bounds_nonincreasing(r_lb=r_lb, r_ub=r_ub)
+    _print_bounds_diagnostic(bounds_diag)
+    if bounds_diag["n_violations"] > 0:
+        raise RuntimeError(
+            "Infeasible position-level bounds under monotone nonincreasing thresholds "
+            "(r[p] >= r[p+1]) before MILP solve. "
+            "See printed bounds diagnostic for violating positions."
+        )
 
     n_sessions = len(examples)
 
@@ -517,6 +607,8 @@ def solve_first_trigger_stop_ip(
     epsilon: float = 1e-6,
     n_customer_types: int = 1,
     objective_type: str = "segmentation",
+    r_lower_bound: float = None,
+    r_upper_bound: float = None,
 ) -> StopIPResult:
     """Solve the main IP formulation from AI-IP-Notes.
 
@@ -534,6 +626,8 @@ def solve_first_trigger_stop_ip(
             n_customer_types=n_customer_types,
             epsilon=epsilon,
             objective_type=objective_type,
+            r_lower_bound=r_lower_bound,
+            r_upper_bound=r_upper_bound,
         )
     else:
         thresholds, objective_hits, assigned_type_idx, predicted_stop_idx = _solve_main_stop_ip_scipy(
@@ -541,6 +635,8 @@ def solve_first_trigger_stop_ip(
             n_customer_types=n_customer_types,
             epsilon=epsilon,
             objective_type=objective_type,
+            r_lower_bound=r_lower_bound,
+            r_upper_bound=r_upper_bound,
         )
 
     hit_rate = float(objective_hits) / float(len(examples))
@@ -561,6 +657,8 @@ def fit_stop_ip_from_notebook_outputs(
     n_customer_types: int = 1,
     epsilon: float = 1e-6,
     objective_type: str = "segmentation",
+    r_lower_bound: float = None,
+    r_upper_bound: float = None,
     session_col: str = "srch_id",
     position_col: str = "position",
     click_col: str = "click_bool",
@@ -596,6 +694,8 @@ def fit_stop_ip_from_notebook_outputs(
         epsilon=epsilon,
         n_customer_types=n_customer_types,
         objective_type=objective_type,
+        r_lower_bound=r_lower_bound,
+        r_upper_bound=r_upper_bound,
     )
 
     return result, examples, mean, std
