@@ -307,13 +307,14 @@ def _solve_main_stop_ip_scipy(
             )
 
         if objective_type == "segmentation":
-            # (4) At most one type can explain each session.
+            # Segmentation model: each session can be assigned to at most one type.
             add_row(
                 {x_index[s, k]: 1.0 for k in range(n_customer_types)},
                 -np.inf,
                 1.0,
             )
-        else:
+
+        if objective_type != "segmentation":
             # Coverage model:
             # Constraint 2: sum_k x_sk <= K * z_s
             coverage_coeffs = {x_index[s, k]: 1.0 for k in range(n_customer_types)}
@@ -456,12 +457,13 @@ def _solve_main_stop_ip_gurobi(
             )
 
         if objective_type == "segmentation":
-            # (4) At most one type can explain session s.
+            # Segmentation model: each session can be assigned to at most one type.
             model.addConstr(
                 gp.quicksum(x[s, k] for k in range(n_customer_types)) <= 1,
                 name=f"one_type_{s}",
             )
-        else:
+
+        if objective_type != "segmentation":
             # Coverage model:
             # Constraint 2: sum_k x_sk <= K * z_s
             model.addConstr(
@@ -561,7 +563,7 @@ def build_session_examples_from_mnl(
 ) -> List[SessionExample]:
     """Build session-level w_si and observed stopping labels.
 
-    In the main formulation, w_si is the linear index h_si dot beta_hat.
+    In the main formulation, w_si is exp(h_si dot beta_hat).
     """
     beta = np.asarray(beta_hat, dtype=np.float64).reshape(-1)
     mean = np.asarray(mean, dtype=np.float64).reshape(-1)
@@ -584,7 +586,8 @@ def build_session_examples_from_mnl(
         x_raw = g[feature_list].values.astype(np.float64)
         x_scaled = (x_raw - mean.reshape(1, -1)) / std.reshape(1, -1)
 
-        weights = x_scaled @ beta
+        utilities = x_scaled @ beta
+        weights = np.exp(utilities)
 
         local_stop = int(np.where(g[position_col].values == deepest_click_rank)[0][0])
 
@@ -667,7 +670,7 @@ def fit_stop_ip_from_notebook_outputs(
 
     Steps:
     1) Rebuild the same scaler used in MNL estimation transformation
-    2) Build per-session linear indices w_si = h_si dot beta_hat
+    2) Build per-session MNL weights w_si = exp(h_si dot beta_hat)
     3) Solve the main K-type stop-position IP
     """
     mean, std = compute_vertical_mnl_scaler(
