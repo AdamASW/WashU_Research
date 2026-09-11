@@ -5,7 +5,7 @@ IP's binary assignment variables are eliminated: each DP transition rewards
 sessions whose observed stop is explained by at least one customer type.
 """
 
-from itertools import product
+from itertools import combinations_with_replacement, product
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -114,11 +114,14 @@ def _candidate_values(
 
 def _ordered_states(values: np.ndarray, n_customer_types: int) -> List[ThresholdState]:
     """Return position states, applying IP symmetry breaking at position 0."""
-    states = [tuple(float(x) for x in state)
-              for state in product(values, repeat=n_customer_types)]
-    return [state for state in states
-            if all(state[k] >= state[k + 1]
-                   for k in range(n_customer_types - 1))]
+    # combinations_with_replacement avoids constructing the discarded
+    # permutations of the position-0 symmetry-broken states.
+    return [
+        tuple(float(value) for value in reversed(combination))
+        for combination in combinations_with_replacement(
+            values, n_customer_types
+        )
+    ]
 
 
 def _session_explained(
@@ -132,18 +135,87 @@ def _session_explained(
     t = ex.true_stop_idx
     if t == 0:
         return any(current[k] <= cumulative[0] for k in range(len(current)))
-
     if previous is None:
         raise ValueError("A previous threshold state is required for t > 0.")
-
-    # Positive weights make all pre-stop constraints equivalent to the final
-    # one, as described in DP-Notes.md.
     required_previous = cumulative[t - 1] + epsilon
     stop_value = cumulative[t]
     return any(
         previous[k] >= required_previous and current[k] <= stop_value
         for k in range(len(current))
     )
+
+
+def _base_rewards(
+    states: List[ThresholdState],
+    sessions: List[Tuple[SessionExample, np.ndarray]],
+) -> np.ndarray:
+    """Vectorized rewards for position zero states."""
+    state_values = np.asarray(states, dtype=np.float64)
+    rewards = np.zeros(len(states), dtype=np.int64)
+    for _, cumulative in sessions:
+        rewards += np.any(state_values <= cumulative[0], axis=1)
+    return rewards
+
+
+def _best_transition_scores(
+    previous_states: np.ndarray,
+    current_states: np.ndarray,
+    previous_scores: np.ndarray,
+    sessions: List[Tuple[SessionExample, np.ndarray]],
+    epsilon: float,
+    current_chunk_size: int = 32,
+    previous_chunk_size: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Find best predecessor scores without materializing all transitions."""
+    n_current = len(current_states)
+    n_previous = len(previous_states)
+    best_scores = np.full(n_current, -np.inf, dtype=np.float64)
+    best_previous_indices = np.full(n_current, -1, dtype=np.int64)
+
+    for current_start in range(0, n_current, current_chunk_size):
+        current_stop = min(current_start + current_chunk_size, n_current)
+        current_chunk = current_states[current_start:current_stop]
+        chunk_best_scores = np.full(current_stop - current_start, -np.inf)
+        chunk_best_indices = np.full(current_stop - current_start, -1, dtype=np.int64)
+
+        for previous_start in range(0, n_previous, previous_chunk_size):
+            previous_stop = min(previous_start + previous_chunk_size, n_previous)
+            previous_chunk = previous_states[previous_start:previous_stop]
+            previous_score_chunk = previous_scores[previous_start:previous_stop]
+            feasible = np.all(
+                previous_chunk[None, :, :] >= current_chunk[:, None, :], axis=2
+            )
+            rewards = np.zeros(
+                (current_stop - current_start, previous_stop - previous_start),
+                dtype=np.int32,
+            )
+            for example, cumulative in sessions:
+                stop_index = example.true_stop_idx
+                required_previous = cumulative[stop_index - 1] + epsilon
+                stop_value = cumulative[stop_index]
+                type_matches = np.logical_and(
+                    previous_chunk[None, :, :] >= required_previous,
+                    current_chunk[:, None, :] <= stop_value,
+                )
+                rewards += np.any(type_matches, axis=2)
+
+            tile_scores = np.where(
+                feasible,
+                previous_score_chunk[None, :] + rewards,
+                -np.inf,
+            )
+            tile_indices = np.argmax(tile_scores, axis=1)
+            tile_best_scores = tile_scores[
+                np.arange(current_stop - current_start), tile_indices
+            ]
+            update = tile_best_scores > chunk_best_scores
+            chunk_best_scores[update] = tile_best_scores[update]
+            chunk_best_indices[update] = previous_start + tile_indices[update]
+
+        best_scores[current_start:current_stop] = chunk_best_scores
+        best_previous_indices[current_start:current_stop] = chunk_best_indices
+
+    return best_scores, best_previous_indices
 
 
 def _solve_dp(
@@ -174,36 +246,41 @@ def _solve_dp(
     for ex, cum in zip(examples, cumulative):
         sessions_at_position[ex.true_stop_idx].append((ex, cum))
 
-    def reward(
-        p: int,
-        previous: Optional[ThresholdState],
-        current: ThresholdState,
-    ) -> int:
-        return sum(
-            _session_explained(ex, cum, previous, current, epsilon)
-            for ex, cum in sessions_at_position[p]
-        )
-
+    first_states = states_by_position[0]
+    first_rewards = _base_rewards(first_states, sessions_at_position[0])
     dp: Dict[ThresholdState, float] = {
-        state: float(reward(0, None, state))
-        for state in states_by_position[0]
+        state: float(score)
+        for state, score in zip(first_states, first_rewards)
     }
     backpointers: List[Dict[ThresholdState, Optional[ThresholdState]]] = [
         {state: None for state in dp}
     ]
 
     for p in range(1, n_pos):
+        previous_states = list(dp)
+        current_states = states_by_position[p]
+        previous_array = np.asarray(previous_states, dtype=np.float64)
+        current_array = np.asarray(current_states, dtype=np.float64)
+        previous_scores = np.asarray(
+            [dp[state] for state in previous_states], dtype=np.float64
+        )
+
+        best_scores, best_previous_indices = _best_transition_scores(
+            previous_states=previous_array,
+            current_states=current_array,
+            previous_scores=previous_scores,
+            sessions=sessions_at_position[p],
+            epsilon=epsilon,
+        )
+
         next_dp: Dict[ThresholdState, float] = {}
         next_back: Dict[ThresholdState, Optional[ThresholdState]] = {}
-
-        for current in states_by_position[p]:
-            for previous, previous_score in dp.items():
-                if any(previous[k] < current[k] for k in range(n_customer_types)):
-                    continue
-                score = previous_score + reward(p, previous, current)
-                if score > next_dp.get(current, -np.inf):
-                    next_dp[current] = score
-                    next_back[current] = previous
+        for current_index, current in enumerate(current_states):
+            if not np.isfinite(best_scores[current_index]):
+                continue
+            previous = previous_states[best_previous_indices[current_index]]
+            next_dp[current] = float(best_scores[current_index])
+            next_back[current] = previous
 
         if not next_dp:
             raise RuntimeError(
