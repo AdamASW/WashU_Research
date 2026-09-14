@@ -17,6 +17,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef STOP_POSITION_DP_PYBIND
+#include <pybind11/stl.h>
+#include <pybind11/pybind11.h>
+#endif
+
 namespace stop_position_dp {
 
 struct SessionExample {
@@ -374,6 +379,73 @@ StopDPResult solve_first_trigger_stop_dp(
 }
 
 }  // namespace stop_position_dp
+
+#ifdef STOP_POSITION_DP_PYBIND
+namespace py = pybind11;
+
+PYBIND11_MODULE(stop_position_dp_cpp, module) {
+    module.doc() = "Pybind11 bindings for the stop-position dynamic program.";
+    module.def(
+        "solve_first_trigger_stop_dp",
+        [](const py::list& python_examples,
+           std::size_t n_customer_types,
+           double epsilon,
+           const std::string& objective_type,
+           py::object r_lower_bound,
+           py::object r_upper_bound) {
+            if (r_lower_bound.is_none() != r_upper_bound.is_none()) {
+                throw std::invalid_argument(
+                    "Provide both r_lower_bound and r_upper_bound, or neither.");
+            }
+
+            std::vector<stop_position_dp::SessionExample> examples;
+            examples.reserve(python_examples.size());
+            for (const py::handle item : python_examples) {
+                const py::dict example = py::cast<py::dict>(item);
+                stop_position_dp::SessionExample converted;
+                converted.session_id =
+                    py::cast<std::string>(example[py::str("session_id")]);
+                converted.weights =
+                    py::cast<std::vector<double>>(example[py::str("weights")]);
+                converted.true_stop_idx =
+                    py::cast<std::size_t>(example[py::str("true_stop_idx")]);
+                examples.push_back(std::move(converted));
+            }
+
+            const bool fixed_bounds = !r_lower_bound.is_none();
+            const double lower_bound = fixed_bounds
+                ? py::cast<double>(r_lower_bound) : 0.0;
+            const double upper_bound = fixed_bounds
+                ? py::cast<double>(r_upper_bound) : 0.0;
+            const auto result = stop_position_dp::solve_first_trigger_stop_dp(
+                examples, n_customer_types, epsilon, objective_type,
+                lower_bound, upper_bound, fixed_bounds);
+
+            py::dict assigned_type_idx;
+            py::dict predicted_stop_idx;
+            for (const auto& item : result.assigned_type_idx) {
+                assigned_type_idx[py::str(item.first)] = item.second;
+            }
+            for (const auto& item : result.predicted_stop_idx) {
+                predicted_stop_idx[py::str(item.first)] = item.second;
+            }
+
+            py::dict output;
+            output["thresholds"] = result.thresholds;
+            output["objective_hits"] = result.objective_hits;
+            output["hit_rate"] = result.hit_rate;
+            output["assigned_type_idx"] = assigned_type_idx;
+            output["predicted_stop_idx"] = predicted_stop_idx;
+            return output;
+        },
+        py::arg("examples"),
+        py::arg("n_customer_types") = 1,
+        py::arg("epsilon") = 1e-6,
+        py::arg("objective_type") = "segmentation",
+        py::arg("r_lower_bound") = py::none(),
+        py::arg("r_upper_bound") = py::none());
+}
+#endif
 
 #ifdef STOP_POSITION_DP_MAIN
 int main() {
