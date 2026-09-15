@@ -670,10 +670,10 @@ StopDPResult solve_first_trigger_stop_dp(
                 std::vector<std::size_t> current_coordinate(n_customer_types);
                 for (std::size_t type = 0; type < n_customer_types; ++type) {
                     current_coordinate[type] = static_cast<std::size_t>(
-                        std::lower_bound(candidates[position].begin(),
-                                         candidates[position].end(),
+                        std::lower_bound(candidates[position - 1].begin(),
+                                         candidates[position - 1].end(),
                                          current_states[current][type]) -
-                        candidates[position].begin());
+                        candidates[position - 1].begin());
                 }
                 std::vector<std::pair<std::vector<std::size_t>, double>> updates;
                 for (std::size_t session : sessions_at_position[position]) {
