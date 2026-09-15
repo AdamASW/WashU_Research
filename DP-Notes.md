@@ -210,11 +210,23 @@ options have the same objective value in this DP implementation.
 
 ## Implementation notes
 
-The number of states at position $p$ is approximately
+The number of states at position $p$ is
 
 $$
-|\mathcal{R}_p|^K.
+\binom{|\mathcal{R}_p|+K-1}{K}.
 $$
+
+Threshold vectors are sorted, so only combinations with repetition are
+generated.  This removes the $K!$ symmetric copies at every position.  For
+$K=1$, transitions are evaluated by a descending sweep over the current
+threshold.  A lazy suffix range-add/range-max tree maintains predecessor
+values plus the hits activated by $S_s\ge b$ and returns both the best value
+and its predecessor, avoiding the pairwise state transition loop.  For
+$K=2$ and $K=3$, a sparse multidimensional lazy range-add/range-max tree
+performs the orthant query directly.  Inclusion-exclusion over active type
+coordinates represents each existential same-type reward exactly once.  The
+tree returns both the orthant maximum and its predecessor for backtracking.
+The original pairwise fallback remains only for unsupported $K>3$.
 
 The implementation avoids allocating the full transition matrix
 
@@ -222,8 +234,7 @@ $$
 |\text{current states}|\times|\text{previous states}|.
 $$
 
-Instead, it evaluates current and previous states in NumPy tiles, computes
-same-type rewards within each tile, and retains only the best predecessor and
+For the general multi-type fallback it retains only the best predecessor and
 score for each current state. At position zero, ordered states are generated
 directly rather than by generating and discarding all permutations.
 

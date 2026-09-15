@@ -205,23 +205,322 @@ std::vector<State> ordered_states(const std::vector<double>& values,
     return states;
 }
 
-std::vector<State> product_states(const std::vector<double>& values,
-                                   std::size_t n_types) {
-    std::vector<State> states;
-    State state(n_types);
-    std::function<void(std::size_t)> build = [&](std::size_t slot) {
-        if (slot == n_types) {
-            states.push_back(state);
+class SuffixMaxTree {
+public:
+    explicit SuffixMaxTree(const std::vector<double>& values)
+        : size_(values.size()), tree_(values.size() * 4),
+          lazy_(values.size() * 4, 0.0) {
+        if (size_ != 0) {
+            build(1, 0, size_ - 1, values);
+        }
+    }
+
+    void add(std::size_t first, double value) {
+        if (first >= size_) {
             return;
         }
-        for (double value : values) {
-            state[slot] = value;
-            build(slot + 1);
+        add(1, 0, size_ - 1, first, size_ - 1, value);
+    }
+
+    std::pair<double, std::size_t> maximum(std::size_t first) {
+        if (first >= size_) {
+            return {-std::numeric_limits<double>::infinity(), size_};
         }
+        const Entry result = query(1, 0, size_ - 1, first, size_ - 1);
+        return {result.score, result.index};
+    }
+
+private:
+    struct Entry {
+        double score = -std::numeric_limits<double>::infinity();
+        std::size_t index = 0;
     };
-    build(0);
-    return states;
-}
+
+    std::size_t size_;
+    std::vector<Entry> tree_;
+    std::vector<double> lazy_;
+
+    static Entry better(const Entry& left, const Entry& right) {
+        return left.score >= right.score ? left : right;
+    }
+
+    void build(std::size_t node, std::size_t left, std::size_t right,
+               const std::vector<double>& values) {
+        if (left == right) {
+            tree_[node] = {values[left], left};
+            return;
+        }
+        const std::size_t middle = left + (right - left) / 2;
+        build(node * 2, left, middle, values);
+        build(node * 2 + 1, middle + 1, right, values);
+        tree_[node] = better(tree_[node * 2], tree_[node * 2 + 1]);
+    }
+
+    void apply(std::size_t node, double value) {
+        tree_[node].score += value;
+        lazy_[node] += value;
+    }
+
+    void push(std::size_t node) {
+        if (lazy_[node] == 0.0) {
+            return;
+        }
+        apply(node * 2, lazy_[node]);
+        apply(node * 2 + 1, lazy_[node]);
+        lazy_[node] = 0.0;
+    }
+
+    void add(std::size_t node, std::size_t left, std::size_t right,
+             std::size_t query_left, std::size_t query_right, double value) {
+        if (query_left <= left && right <= query_right) {
+            apply(node, value);
+            return;
+        }
+        push(node);
+        const std::size_t middle = left + (right - left) / 2;
+        if (query_left <= middle) {
+            add(node * 2, left, middle, query_left, query_right, value);
+        }
+        if (query_right > middle) {
+            add(node * 2 + 1, middle + 1, right, query_left, query_right,
+                value);
+        }
+        tree_[node] = better(tree_[node * 2], tree_[node * 2 + 1]);
+    }
+
+    Entry query(std::size_t node, std::size_t left, std::size_t right,
+                std::size_t query_left, std::size_t query_right) {
+        if (query_left <= left && right <= query_right) {
+            return tree_[node];
+        }
+        push(node);
+        const std::size_t middle = left + (right - left) / 2;
+        Entry result;
+        if (query_left <= middle) {
+            result = better(result, query(node * 2, left, middle, query_left,
+                                          query_right));
+        }
+        if (query_right > middle) {
+            result = better(result, query(node * 2 + 1, middle + 1, right,
+                                          query_left, query_right));
+        }
+        return result;
+    }
+};
+
+class SparseOrthantMaxTree {
+public:
+    SparseOrthantMaxTree(
+        const std::vector<std::vector<std::size_t>>& coordinates,
+        const std::vector<double>& values,
+        std::size_t dimensions)
+        : dimensions_(dimensions), child_count_(std::size_t(1) << dimensions) {
+        if (dimensions < 2 || dimensions > 3 ||
+            coordinates.size() != values.size()) {
+            throw std::invalid_argument(
+                "SparseOrthantMaxTree requires 2 or 3 dimensions.");
+        }
+        std::vector<std::size_t> points(coordinates.size());
+        std::iota(points.begin(), points.end(), 0);
+        std::vector<std::size_t> lower(dimensions, 0);
+        std::vector<std::size_t> upper(dimensions, 0);
+        for (const auto& point : coordinates) {
+            if (point.size() != dimensions) {
+                throw std::invalid_argument("Invalid orthant point dimension.");
+            }
+            for (std::size_t dimension = 0; dimension < dimensions; ++dimension) {
+                upper[dimension] = std::max(upper[dimension], point[dimension]);
+            }
+        }
+        build(lower, upper, points, coordinates, values);
+    }
+
+    void add(const std::vector<std::size_t>& lower, double value) {
+        add(0, lower, value);
+    }
+
+    std::pair<double, std::size_t> maximum(
+        const std::vector<std::size_t>& lower) {
+        return maximum(0, lower);
+    }
+
+private:
+    struct Node {
+        std::vector<std::size_t> lower;
+        std::vector<std::size_t> upper;
+        std::vector<std::size_t> children;
+        double score = -std::numeric_limits<double>::infinity();
+        std::size_t index = 0;
+        double lazy = 0.0;
+    };
+
+    std::size_t dimensions_;
+    std::size_t child_count_;
+    std::vector<Node> nodes_;
+
+    static std::size_t invalid_node() {
+        return std::numeric_limits<std::size_t>::max();
+    }
+
+    static std::pair<double, std::size_t> better(
+        const std::pair<double, std::size_t>& left,
+        const std::pair<double, std::size_t>& right) {
+        return left.first >= right.first ? left : right;
+    }
+
+    std::size_t build(
+        const std::vector<std::size_t>& lower,
+        const std::vector<std::size_t>& upper,
+        const std::vector<std::size_t>& points,
+        const std::vector<std::vector<std::size_t>>& coordinates,
+        const std::vector<double>& values) {
+        const std::size_t node_index = nodes_.size();
+        nodes_.push_back({lower, upper,
+                          std::vector<std::size_t>(child_count_, invalid_node()),
+                          -std::numeric_limits<double>::infinity(), 0, 0.0});
+        bool leaf = true;
+        for (std::size_t dimension = 0; dimension < dimensions_; ++dimension) {
+            leaf = leaf && lower[dimension] == upper[dimension];
+        }
+        if (leaf) {
+            for (std::size_t point : points) {
+                if (values[point] > nodes_[node_index].score) {
+                    nodes_[node_index].score = values[point];
+                    nodes_[node_index].index = point;
+                }
+            }
+            return node_index;
+        }
+
+        std::vector<std::size_t> middle(dimensions_);
+        for (std::size_t dimension = 0; dimension < dimensions_; ++dimension) {
+            middle[dimension] =
+                lower[dimension] + (upper[dimension] - lower[dimension]) / 2;
+        }
+        std::vector<std::vector<std::size_t>> child_points(child_count_);
+        for (std::size_t point : points) {
+            std::size_t child = 0;
+            for (std::size_t dimension = 0; dimension < dimensions_; ++dimension) {
+                if (coordinates[point][dimension] > middle[dimension]) {
+                    child |= std::size_t(1) << dimension;
+                }
+            }
+            child_points[child].push_back(point);
+        }
+        for (std::size_t child = 0; child < child_count_; ++child) {
+            if (child_points[child].empty()) {
+                continue;
+            }
+            std::vector<std::size_t> child_lower = lower;
+            std::vector<std::size_t> child_upper = upper;
+            for (std::size_t dimension = 0; dimension < dimensions_; ++dimension) {
+                if (child & (std::size_t(1) << dimension)) {
+                    child_lower[dimension] = middle[dimension] + 1;
+                } else {
+                    child_upper[dimension] = middle[dimension];
+                }
+            }
+            nodes_[node_index].children[child] =
+                build(child_lower, child_upper, child_points[child],
+                      coordinates, values);
+        }
+        pull(node_index);
+        return node_index;
+    }
+
+    bool outside(const Node& node,
+                 const std::vector<std::size_t>& lower) const {
+        for (std::size_t dimension = 0; dimension < dimensions_; ++dimension) {
+            if (node.upper[dimension] < lower[dimension]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool covered(const Node& node,
+                 const std::vector<std::size_t>& lower) const {
+        for (std::size_t dimension = 0; dimension < dimensions_; ++dimension) {
+            if (node.lower[dimension] < lower[dimension]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void apply(std::size_t node_index, double value) {
+        Node& node = nodes_[node_index];
+        node.score += value;
+        node.lazy += value;
+    }
+
+    void push(std::size_t node_index) {
+        const double value = nodes_[node_index].lazy;
+        if (value == 0.0) {
+            return;
+        }
+        for (std::size_t child : nodes_[node_index].children) {
+            if (child != invalid_node()) {
+                apply(child, value);
+            }
+        }
+        nodes_[node_index].lazy = 0.0;
+    }
+
+    void pull(std::size_t node_index) {
+        Node& node = nodes_[node_index];
+        for (std::size_t child : node.children) {
+            if (child != invalid_node()) {
+                const auto candidate =
+                    std::make_pair(nodes_[child].score, nodes_[child].index);
+                const auto current = std::make_pair(node.score, node.index);
+                const auto best = better(current, candidate);
+                node.score = best.first;
+                node.index = best.second;
+            }
+        }
+    }
+
+    void add(std::size_t node_index,
+             const std::vector<std::size_t>& lower, double value) {
+        Node& node = nodes_[node_index];
+        if (outside(node, lower)) {
+            return;
+        }
+        if (covered(node, lower)) {
+            apply(node_index, value);
+            return;
+        }
+        push(node_index);
+        for (std::size_t child : node.children) {
+            if (child != invalid_node()) {
+                add(child, lower, value);
+            }
+        }
+        node.score = -std::numeric_limits<double>::infinity();
+        pull(node_index);
+    }
+
+    std::pair<double, std::size_t> maximum(
+        std::size_t node_index, const std::vector<std::size_t>& lower) {
+        const Node& node = nodes_[node_index];
+        if (outside(node, lower)) {
+            return {-std::numeric_limits<double>::infinity(), node.index};
+        }
+        if (covered(node, lower)) {
+            return {node.score, node.index};
+        }
+        push(node_index);
+        std::pair<double, std::size_t> result = {
+            -std::numeric_limits<double>::infinity(), node.index};
+        for (std::size_t child : nodes_[node_index].children) {
+            if (child != invalid_node()) {
+                result = better(result, maximum(child, lower));
+            }
+        }
+        return result;
+    }
+};
 
 bool session_explained(const SessionExample& example,
                        const std::vector<double>& sums,
@@ -273,8 +572,10 @@ StopDPResult solve_first_trigger_stop_dp(
     states_by_position.push_back(
         ordered_states(candidates[0], n_customer_types));
     for (std::size_t position = 1; position < data.n_positions; ++position) {
+        // Customer labels are interchangeable.  Canonicalizing every
+        // position removes the K!-fold duplicate states, not just at p=0.
         states_by_position.push_back(
-            product_states(candidates[position], n_customer_types));
+            ordered_states(candidates[position], n_customer_types));
     }
 
     std::vector<std::vector<std::size_t>> sessions_at_position(data.n_positions);
@@ -301,31 +602,153 @@ StopDPResult solve_first_trigger_stop_dp(
         std::vector<double> next_scores(current_states.size(),
                                         -std::numeric_limits<double>::infinity());
         std::vector<int> next_back(current_states.size(), -1);
-        for (std::size_t current = 0; current < current_states.size(); ++current) {
-            for (std::size_t previous = 0; previous < previous_states.size(); ++previous) {
-                bool monotone = true;
+
+        if (n_customer_types == 1) {
+            // Sweep current thresholds from high to low.  Once a session is
+            // active (S >= b), it contributes one to every predecessor
+            // suffix a >= Q.  The segment tree therefore maintains
+            // V_{p-1}(a) plus all currently active hits and answers the
+            // required suffix maximum, including its argmax.
+            std::vector<std::size_t> session_order =
+                sessions_at_position[position];
+            std::sort(session_order.begin(), session_order.end(),
+                      [&](std::size_t left, std::size_t right) {
+                          return data.cumulative[left][position] >
+                                 data.cumulative[right][position];
+                      });
+            std::vector<double> previous_values;
+            previous_values.reserve(previous_states.size());
+            for (auto state = previous_states.rbegin();
+                 state != previous_states.rend(); ++state) {
+                previous_values.push_back((*state)[0]);
+            }
+            std::vector<double> reversed_scores(scores.rbegin(), scores.rend());
+            SuffixMaxTree tree(reversed_scores);
+            std::size_t next_session = 0;
+            for (std::size_t current = 0; current < current_states.size();
+                 ++current) {
+                const double threshold = current_states[current][0];
+                while (next_session < session_order.size() &&
+                       data.cumulative[session_order[next_session]][position] >=
+                           threshold) {
+                    const std::size_t session = session_order[next_session++];
+                    const double required =
+                        data.cumulative[session][position - 1] + epsilon;
+                    const auto first = static_cast<std::size_t>(
+                        std::lower_bound(previous_values.begin(),
+                                         previous_values.end(), required) -
+                        previous_values.begin());
+                    tree.add(first, 1.0);
+                }
+                const auto first = static_cast<std::size_t>(
+                    std::lower_bound(previous_values.begin(), previous_values.end(),
+                                     threshold) - previous_values.begin());
+                const auto best = tree.maximum(first);
+                if (best.second < previous_states.size()) {
+                    next_scores[current] = best.first;
+                    next_back[current] = static_cast<int>(
+                        previous_states.size() - 1 - best.second);
+                }
+            }
+        } else if (n_customer_types == 2 || n_customer_types == 3) {
+            std::vector<std::vector<std::size_t>> coordinates;
+            coordinates.reserve(previous_states.size());
+            for (const auto& state : previous_states) {
+                std::vector<std::size_t> coordinate(n_customer_types);
                 for (std::size_t type = 0; type < n_customer_types; ++type) {
-                    if (previous_states[previous][type] <
-                        current_states[current][type]) {
-                        monotone = false;
-                        break;
-                    }
+                    coordinate[type] = static_cast<std::size_t>(
+                        std::lower_bound(candidates[position - 1].begin(),
+                                         candidates[position - 1].end(),
+                                         state[type]) -
+                        candidates[position - 1].begin());
                 }
-                if (!monotone) {
-                    continue;
+                coordinates.push_back(std::move(coordinate));
+            }
+            SparseOrthantMaxTree tree(coordinates, scores, n_customer_types);
+            for (std::size_t current = 0; current < current_states.size();
+                 ++current) {
+                std::vector<std::size_t> current_coordinate(n_customer_types);
+                for (std::size_t type = 0; type < n_customer_types; ++type) {
+                    current_coordinate[type] = static_cast<std::size_t>(
+                        std::lower_bound(candidates[position].begin(),
+                                         candidates[position].end(),
+                                         current_states[current][type]) -
+                        candidates[position].begin());
                 }
-                double score = scores[previous];
+                std::vector<std::pair<std::vector<std::size_t>, double>> updates;
                 for (std::size_t session : sessions_at_position[position]) {
-                    if (session_explained(examples[session],
-                                          data.cumulative[session],
-                                          &previous_states[previous],
-                                          current_states[current], epsilon)) {
-                        score += 1.0;
+                    const double stop_value = data.cumulative[session][position];
+                    const double required =
+                        data.cumulative[session][position - 1] + epsilon;
+                    std::size_t active_mask = 0;
+                    for (std::size_t type = 0; type < n_customer_types; ++type) {
+                        if (current_states[current][type] <= stop_value) {
+                            active_mask |= std::size_t(1) << type;
+                        }
+                    }
+                    for (std::size_t subset = active_mask; subset != 0;
+                         subset = (subset - 1) & active_mask) {
+                        std::vector<std::size_t> lower(n_customer_types, 0);
+                        for (std::size_t type = 0; type < n_customer_types;
+                             ++type) {
+                            if (subset & (std::size_t(1) << type)) {
+                                lower[type] = static_cast<std::size_t>(
+                                    std::lower_bound(
+                                        candidates[position - 1].begin(),
+                                        candidates[position - 1].end(), required) -
+                                    candidates[position - 1].begin());
+                            }
+                        }
+                        std::size_t bit_count = 0;
+                        for (std::size_t bits = subset; bits != 0;
+                             bits &= bits - 1) {
+                            ++bit_count;
+                        }
+                        const double sign = (bit_count % 2 == 1) ? 1.0 : -1.0;
+                        tree.add(lower, sign);
+                        updates.emplace_back(std::move(lower), sign);
                     }
                 }
-                if (score > next_scores[current]) {
-                    next_scores[current] = score;
-                    next_back[current] = static_cast<int>(previous);
+                const auto best = tree.maximum(current_coordinate);
+                for (const auto& update : updates) {
+                    tree.add(update.first, -update.second);
+                }
+                if (best.second < previous_states.size()) {
+                    next_scores[current] = best.first;
+                    next_back[current] = static_cast<int>(best.second);
+                }
+            }
+        } else {
+            for (std::size_t current = 0; current < current_states.size();
+                 ++current) {
+                for (std::size_t previous = 0;
+                     previous < previous_states.size(); ++previous) {
+                    bool monotone = true;
+                    for (std::size_t type = 0; type < n_customer_types;
+                         ++type) {
+                        if (previous_states[previous][type] <
+                            current_states[current][type]) {
+                            monotone = false;
+                            break;
+                        }
+                    }
+                    if (!monotone) {
+                        continue;
+                    }
+                    double score = scores[previous];
+                    for (std::size_t session :
+                         sessions_at_position[position]) {
+                        if (session_explained(
+                                examples[session], data.cumulative[session],
+                                &previous_states[previous],
+                                current_states[current], epsilon)) {
+                            score += 1.0;
+                        }
+                    }
+                    if (score > next_scores[current]) {
+                        next_scores[current] = score;
+                        next_back[current] = static_cast<int>(previous);
+                    }
                 }
             }
         }
