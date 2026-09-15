@@ -1,0 +1,90 @@
+=== Stop Position DP (In-Sample) ===
+Sessions used: 122
+Customer types (K): 3
+Epsilon: 1e-06
+Objective (explained sessions): 74.0
+Hit Rate: 0.6066
+Avg Predicted Rank (explained sessions): 1.878
+Avg True Rank: 3.713
+Type assignment counts: {0: 21, 1: 27, 2: 26}
+Unassigned sessions: 48
+Threshold matrix shape [N, K]: (9, 3)
+Threshold matrix (all positions):
+[[100.         1.94666    0.712146]
+ [  4.053714   1.411205   0.      ]
+ [  2.330367   0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]]
+Assigned-session constraint violations: 0
+
+=== Stop Position DP (In-Sample) ===
+Sessions used: 127
+Customer types (K): 3
+Epsilon: 1e-06
+Objective (explained sessions): 112.0
+Hit Rate: 0.8819
+Avg Predicted Rank (explained sessions): 1.812
+Avg True Rank: 2.071
+Type assignment counts: {0: 31, 1: 34, 2: 47}
+Unassigned sessions: 15
+Threshold matrix shape [N, K]: (4, 3)
+Threshold matrix (all positions):
+[[100.         1.759747   0.      ]
+ [  3.449458   0.         0.      ]
+ [  2.144896   0.         0.      ]
+ [  0.         0.         0.      ]]
+Assigned-session constraint violations: 0
+
+=== Stop Position DP (In-Sample) ===
+Sessions used: 405
+Customer types (K): 2
+Epsilon: 1e-06
+Objective (explained sessions): 164.0
+Hit Rate: 0.4049
+Avg Predicted Rank (explained sessions): 1.506
+Avg True Rank: 3.859
+Type assignment counts: {0: 71, 1: 93}
+Unassigned sessions: 241
+Threshold matrix shape [N, K]: (9, 2)
+Threshold matrix (all positions):
+[[2.388017 0.214787]
+ [2.047058 0.      ]
+ [0.       0.      ]
+ [0.       0.      ]
+ [0.       0.      ]
+ [0.       0.      ]
+ [0.       0.      ]
+ [0.       0.      ]
+ [0.       0.      ]]
+Assigned-session constraint violations: 0
+
+=== Stop Position DP (In-Sample) === (81mins)
+Sessions used: 146
+Customer types (K): 3
+Epsilon: 1e-06
+Objective (explained sessions): 76.0
+Hit Rate: 0.5205
+Avg Predicted Rank (explained sessions): 2.355
+Avg True Rank: 4.781
+Type assignment counts: {0: 18, 1: 34, 2: 24}
+Unassigned sessions: 70
+Threshold matrix shape [N, K]: (13, 3)
+Threshold matrix (all positions):
+[[100.         1.956134   0.385841]
+ [100.         1.615224   0.      ]
+ [  6.079923   0.         0.      ]
+ [  6.038167   0.         0.      ]
+ [  6.011075   0.         0.      ]
+ [  5.131035   0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]
+ [  0.         0.         0.      ]]
+Assigned-session constraint violations: 0
