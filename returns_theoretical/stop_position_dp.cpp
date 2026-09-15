@@ -4,6 +4,7 @@
 // library and operates on cumulative session weights.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <functional>
@@ -37,6 +38,14 @@ struct StopDPResult {
     std::unordered_map<std::string, int> assigned_type_idx;
     std::unordered_map<std::string, int> predicted_stop_idx;
 };
+
+using ProgressCallback = std::function<void(
+    std::size_t position,
+    std::size_t total_positions,
+    std::size_t states_processed,
+    std::size_t total_states,
+    double elapsed_seconds,
+    double best_score)>;
 
 using State = std::vector<double>;
 
@@ -556,7 +565,9 @@ StopDPResult solve_first_trigger_stop_dp(
     const std::string& objective_type = "segmentation",
     double r_lower_bound = 0.0,
     double r_upper_bound = 0.0,
-    bool fixed_bounds = false) {
+    bool fixed_bounds = false,
+    ProgressCallback progress_callback = nullptr,
+    std::size_t progress_interval = 10000) {
     if (n_customer_types < 1) {
         throw std::invalid_argument("n_customer_types must be >= 1.");
     }
@@ -577,6 +588,12 @@ StopDPResult solve_first_trigger_stop_dp(
         states_by_position.push_back(
             ordered_states(candidates[position], n_customer_types));
     }
+    std::size_t total_states = 0;
+    for (const auto& states : states_by_position) {
+        total_states += states.size();
+    }
+    const auto start_time = std::chrono::steady_clock::now();
+    std::size_t states_processed = 0;
 
     std::vector<std::vector<std::size_t>> sessions_at_position(data.n_positions);
     for (std::size_t index = 0; index < examples.size(); ++index) {
@@ -584,6 +601,20 @@ StopDPResult solve_first_trigger_stop_dp(
     }
 
     std::vector<double> scores(states_by_position[0].size(), 0.0);
+    auto report_progress = [&](std::size_t position, bool force) {
+        if (!progress_callback ||
+            (!force && (progress_interval == 0 ||
+                        states_processed % progress_interval != 0))) {
+            return;
+        }
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time).count();
+        double best_score = scores.empty()
+            ? -std::numeric_limits<double>::infinity()
+            : *std::max_element(scores.begin(), scores.end());
+        progress_callback(position, data.n_positions, states_processed,
+                          total_states, elapsed, best_score);
+    };
     for (std::size_t state_index = 0; state_index < scores.size(); ++state_index) {
         for (std::size_t session : sessions_at_position[0]) {
             if (session_explained(examples[session], data.cumulative[session],
@@ -592,7 +623,9 @@ StopDPResult solve_first_trigger_stop_dp(
                 scores[state_index] += 1.0;
             }
         }
+        ++states_processed;
     }
+    report_progress(0, true);
 
     std::vector<std::vector<int>> backpointers;
     backpointers.push_back(std::vector<int>(scores.size(), -1));
@@ -649,6 +682,8 @@ StopDPResult solve_first_trigger_stop_dp(
                     next_back[current] = static_cast<int>(
                         previous_states.size() - 1 - best.second);
                 }
+                ++states_processed;
+                report_progress(position, false);
             }
         } else if (n_customer_types == 2 || n_customer_types == 3) {
             std::vector<std::vector<std::size_t>> coordinates;
@@ -760,6 +795,8 @@ StopDPResult solve_first_trigger_stop_dp(
                         }
                     }
                 }
+                ++states_processed;
+                report_progress(position, false);
             }
         } else {
             for (std::size_t current = 0; current < current_states.size();
@@ -793,7 +830,18 @@ StopDPResult solve_first_trigger_stop_dp(
                         next_back[current] = static_cast<int>(previous);
                     }
                 }
+                ++states_processed;
+                report_progress(position, false);
             }
+        }
+        if (progress_callback) {
+            const double layer_best = next_scores.empty()
+                ? -std::numeric_limits<double>::infinity()
+                : *std::max_element(next_scores.begin(), next_scores.end());
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time).count();
+            progress_callback(position, data.n_positions, states_processed,
+                              total_states, elapsed, layer_best);
         }
         if (std::none_of(next_back.begin(), next_back.end(),
                          [](int index) { return index >= 0; })) {
@@ -858,7 +906,9 @@ PYBIND11_MODULE(stop_position_dp_cpp, module) {
            double epsilon,
            const std::string& objective_type,
            py::object r_lower_bound,
-           py::object r_upper_bound) {
+           py::object r_upper_bound,
+           py::object progress_callback,
+           std::size_t progress_interval) {
             if (r_lower_bound.is_none() != r_upper_bound.is_none()) {
                 throw std::invalid_argument(
                     "Provide both r_lower_bound and r_upper_bound, or neither.");
@@ -883,9 +933,25 @@ PYBIND11_MODULE(stop_position_dp_cpp, module) {
                 ? py::cast<double>(r_lower_bound) : 0.0;
             const double upper_bound = fixed_bounds
                 ? py::cast<double>(r_upper_bound) : 0.0;
+            stop_position_dp::ProgressCallback callback = nullptr;
+            if (!progress_callback.is_none()) {
+                const py::function python_callback =
+                    py::cast<py::function>(progress_callback);
+                callback = [python_callback](
+                    std::size_t position,
+                    std::size_t total_positions,
+                    std::size_t states_processed,
+                    std::size_t total_states,
+                    double elapsed_seconds,
+                    double best_score) {
+                    python_callback(position, total_positions, states_processed,
+                                    total_states, elapsed_seconds, best_score);
+                };
+            }
             const auto result = stop_position_dp::solve_first_trigger_stop_dp(
                 examples, n_customer_types, epsilon, objective_type,
-                lower_bound, upper_bound, fixed_bounds);
+                lower_bound, upper_bound, fixed_bounds, callback,
+                progress_interval);
 
             py::dict assigned_type_idx;
             py::dict predicted_stop_idx;
@@ -909,7 +975,9 @@ PYBIND11_MODULE(stop_position_dp_cpp, module) {
         py::arg("epsilon") = 1e-6,
         py::arg("objective_type") = "segmentation",
         py::arg("r_lower_bound") = py::none(),
-        py::arg("r_upper_bound") = py::none());
+        py::arg("r_upper_bound") = py::none(),
+        py::arg("progress_callback") = py::none(),
+        py::arg("progress_interval") = 10000);
 }
 #endif
 
@@ -938,8 +1006,31 @@ int main() {
         examples.push_back(std::move(example));
     }
     try {
+        const ProgressCallback progress_callback =
+            [](std::size_t position,
+               std::size_t total_positions,
+               std::size_t states_processed,
+               std::size_t total_states,
+               double elapsed_seconds,
+               double best_score) {
+                const double progress = total_states == 0
+                    ? 100.0
+                    : 100.0 * static_cast<double>(states_processed) /
+                      static_cast<double>(total_states);
+                std::cerr << "\rPosition " << position << "/"
+                          << total_positions << " | Progress " << progress
+                          << "% | States " << states_processed << "/"
+                          << total_states << " | Elapsed "
+                          << elapsed_seconds << " s | Best score "
+                          << best_score << std::flush;
+                if (position + 1 == total_positions &&
+                    states_processed == total_states) {
+                    std::cerr << '\n';
+                }
+            };
         const auto result = solve_first_trigger_stop_dp(
-            examples, n_types, epsilon);
+            examples, n_types, epsilon, "segmentation", 0.0, 0.0, false,
+            progress_callback);
         std::cout << std::setprecision(17) << "objective_hits "
                   << result.objective_hits << "\nhit_rate "
                   << result.hit_rate << "\nthresholds\n";
