@@ -713,9 +713,52 @@ StopDPResult solve_first_trigger_stop_dp(
                 for (const auto& update : updates) {
                     tree.add(update.first, -update.second);
                 }
-                if (best.second < previous_states.size()) {
+                bool valid_best = best.second < previous_states.size();
+                if (valid_best) {
+                    for (std::size_t type = 0; type < n_customer_types; ++type) {
+                        if (previous_states[best.second][type] <
+                            current_states[current][type]) {
+                            valid_best = false;
+                            break;
+                        }
+                    }
+                }
+                if (valid_best) {
                     next_scores[current] = best.first;
                     next_back[current] = static_cast<int>(best.second);
+                } else {
+                    // Keep exact semantics if a sparse boundary query cannot
+                    // identify a feasible predecessor.
+                    for (std::size_t previous = 0;
+                         previous < previous_states.size(); ++previous) {
+                        bool monotone = true;
+                        for (std::size_t type = 0; type < n_customer_types;
+                             ++type) {
+                            if (previous_states[previous][type] <
+                                current_states[current][type]) {
+                                monotone = false;
+                                break;
+                            }
+                        }
+                        if (!monotone) {
+                            continue;
+                        }
+                        double score = scores[previous];
+                        for (std::size_t session :
+                             sessions_at_position[position]) {
+                            if (session_explained(
+                                    examples[session],
+                                    data.cumulative[session],
+                                    &previous_states[previous],
+                                    current_states[current], epsilon)) {
+                                score += 1.0;
+                            }
+                        }
+                        if (score > next_scores[current]) {
+                            next_scores[current] = score;
+                            next_back[current] = static_cast<int>(previous);
+                        }
+                    }
                 }
             }
         } else {
