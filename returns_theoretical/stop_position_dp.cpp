@@ -715,34 +715,29 @@ StopDPResult solve_first_trigger_stop_dp(
                     const double stop_value = data.cumulative[session][position];
                     const double required =
                         data.cumulative[session][position - 1] + epsilon;
-                    std::size_t active_mask = 0;
-                    for (std::size_t type = 0; type < n_customer_types; ++type) {
-                        if (current_states[current][type] <= stop_value) {
-                            active_mask |= std::size_t(1) << type;
-                        }
+                    // Canonical states are descending.  The active current
+                    // coordinates therefore form a suffix, while predecessor
+                    // coordinates meeting `required` form a prefix.  The
+                    // existential same-type reward is true iff those regions
+                    // overlap, which is equivalent to a single lower bound
+                    // on the first active current coordinate.
+                    std::size_t first_active = n_customer_types;
+                    while (first_active > 0 &&
+                           current_states[current][first_active - 1] <=
+                               stop_value) {
+                        --first_active;
                     }
-                    for (std::size_t subset = active_mask; subset != 0;
-                         subset = (subset - 1) & active_mask) {
-                        std::vector<std::size_t> lower(n_customer_types, 0);
-                        for (std::size_t type = 0; type < n_customer_types;
-                             ++type) {
-                            if (subset & (std::size_t(1) << type)) {
-                                lower[type] = static_cast<std::size_t>(
-                                    std::lower_bound(
-                                        candidates[position - 1].begin(),
-                                        candidates[position - 1].end(), required) -
-                                    candidates[position - 1].begin());
-                            }
-                        }
-                        std::size_t bit_count = 0;
-                        for (std::size_t bits = subset; bits != 0;
-                             bits &= bits - 1) {
-                            ++bit_count;
-                        }
-                        const double sign = (bit_count % 2 == 1) ? 1.0 : -1.0;
-                        tree.add(lower, sign);
-                        updates.emplace_back(std::move(lower), sign);
+                    if (first_active == n_customer_types) {
+                        continue;
                     }
+                    std::vector<std::size_t> lower(n_customer_types, 0);
+                    lower[first_active] = static_cast<std::size_t>(
+                        std::lower_bound(
+                            candidates[position - 1].begin(),
+                            candidates[position - 1].end(), required) -
+                        candidates[position - 1].begin());
+                    tree.add(lower, 1.0);
+                    updates.emplace_back(std::move(lower), 1.0);
                 }
                 const auto best = tree.maximum(current_coordinate);
                 for (const auto& update : updates) {

@@ -224,8 +224,10 @@ values plus the hits activated by $S_s\ge b$ and returns both the best value
 and its predecessor, avoiding the pairwise state transition loop.  For
 $K=2$ and $K=3$, a sparse multidimensional lazy range-add/range-max tree
 performs the orthant query directly.  Inclusion-exclusion over active type
-coordinates represents each existential same-type reward exactly once.  The
-tree returns both the orthant maximum and its predecessor for backtracking.
+coordinates is reduced using canonical ordering: active current coordinates
+form a suffix and qualifying predecessor coordinates form a prefix, so each
+session requires only one orthant range update.  The tree returns both the
+orthant maximum and its predecessor for backtracking.
 The original pairwise fallback remains only for unsupported $K>3$.
 
 The C++ solver optionally accepts a progress callback with the signature
