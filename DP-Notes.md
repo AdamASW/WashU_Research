@@ -228,6 +228,13 @@ coordinates represents each existential same-type reward exactly once.  The
 tree returns both the orthant maximum and its predecessor for backtracking.
 The original pairwise fallback remains only for unsupported $K>3$.
 
+The C++ solver optionally accepts a progress callback with the signature
+`(position, total_positions, states_processed, total_states, elapsed_seconds,
+best_score)`.  It reports after each completed layer and, by default, every
+10,000 processed states inside a layer.  The pybind interface exposes this as
+`progress_callback` and `progress_interval`, allowing long K=2/K=3 runs to
+report state-based progress rather than only elapsed time.
+
 The implementation avoids allocating the full transition matrix
 
 $$
